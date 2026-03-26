@@ -1,0 +1,33 @@
+{
+  "vlc_path": "C:/Program Files/VideoLAN/VLC/vlc.exe",
+  "video_extensions": [
+    ".mp4",
+    ".avi",
+    ".mkv",
+    ".mov",
+    ".wmv",
+    ".flv",
+    ".m4v",
+    ".mpg",
+    ".mpeg",
+    ".webm",
+    ".ts",
+    ".vob",
+    ".mts",
+    ".m2ts"
+  ],
+  "schedules": [
+    {
+      "time": "13:00",
+      "folder": "C:\\projects\\vlc\\folder01"
+    },
+    {
+      "time": "19:00",
+      "folder": "C:\\projects\\vlc\\folder02"
+    },
+    {
+      "time": "21:00",
+      "folder": "C:\\projects\\vlc\\folder03"
+    }
+  ]
+}
