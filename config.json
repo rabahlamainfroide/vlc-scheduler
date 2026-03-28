@@ -1,5 +1,6 @@
 {
-  "vlc_path": "/usr/bin/vlc",
+  "vlc_path": "auto",
+  "status_port": 8765,
   "video_extensions": [
     ".mp4",
     ".avi",
@@ -19,15 +20,20 @@
   "schedules": [
     {
       "time": "13:00",
-      "folder": "/home/user/videos/folder01"
+      "folder": "/home/user/videos/folder01",
+      "count": 1,
+      "before_play": "xdg-screensaver reset"
     },
     {
       "time": "19:00",
-      "folder": "/home/user/videos/folder02"
+      "folder": "/home/user/videos/folder02",
+      "count": 3,
+      "before_play": "xdg-screensaver reset"
     },
     {
       "time": "21:00",
-      "folder": "/home/user/videos/folder03"
+      "folder": "/home/user/videos/folder03",
+      "count": 1
     }
   ]
 }
