@@ -1,5 +1,5 @@
 {
-  "vlc_path": "C:/Program Files/VideoLAN/VLC/vlc.exe",
+  "vlc_path": "/usr/bin/vlc",
   "video_extensions": [
     ".mp4",
     ".avi",
@@ -19,15 +19,15 @@
   "schedules": [
     {
       "time": "13:00",
-      "folder": "C:\\projects\\vlc\\folder01"
+      "folder": "/home/user/videos/folder01"
     },
     {
       "time": "19:00",
-      "folder": "C:\\projects\\vlc\\folder02"
+      "folder": "/home/user/videos/folder02"
     },
     {
       "time": "21:00",
-      "folder": "C:\\projects\\vlc\\folder03"
+      "folder": "/home/user/videos/folder03"
     }
   ]
 }

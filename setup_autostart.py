@@ -2,10 +2,10 @@
 """
 setup_autostart.py
 ------------------
-Registers vlc_scheduler.py as a Windows Task Scheduler task that starts
+Registers vlc_scheduler.py as a systemd user service that starts
 automatically when the current user logs in.
 
-Run this script ONCE (as Administrator for best results):
+Usage:
     python setup_autostart.py           # install
     python setup_autostart.py --remove  # uninstall
 """
@@ -14,118 +14,93 @@ import subprocess
 import sys
 from pathlib import Path
 
-TASK_NAME   = "VLCScheduler"
-SCRIPT      = Path(__file__).parent / "vlc_scheduler.py"
-VENV_DIR    = Path(__file__).parent / ".venv"
+SERVICE_NAME = "vlc-scheduler"
+SCRIPT       = Path(__file__).parent.resolve() / "vlc_scheduler.py"
+VENV_DIR     = Path(__file__).parent.resolve() / ".venv"
+SYSTEMD_DIR  = Path.home() / ".config" / "systemd" / "user"
+SERVICE_FILE = SYSTEMD_DIR / f"{SERVICE_NAME}.service"
 
 
 def _find_python() -> Path:
     """
-    Prefer the project's virtual-environment interpreter so the task runs
+    Prefer the project's virtual-environment interpreter so the service runs
     with the correct dependencies installed.  Falls back to the interpreter
     that is running this script.
     """
-    # Virtual environment (created by setup_venv.bat)
-    for candidate in (
-        VENV_DIR / "Scripts" / "pythonw.exe",   # venv, no console window
-        VENV_DIR / "Scripts" / "python.exe",    # venv, with console fallback
-    ):
-        if candidate.exists():
-            return candidate
-
-    # Current interpreter (system or already-active venv)
-    exe  = Path(sys.executable)
-    winless = exe.parent / "pythonw.exe"
-    return winless if winless.exists() else exe
+    candidate = VENV_DIR / "bin" / "python"
+    if candidate.exists():
+        return candidate
+    return Path(sys.executable)
 
 
-PYTHONW_EXE = _find_python()
+def create_service() -> None:
+    python_exe = _find_python()
 
-
-def create_task() -> None:
-    print(f"Python  : {PYTHONW_EXE}")
+    print(f"Python  : {python_exe}")
     print(f"Script  : {SCRIPT}")
-    print(f"Task    : {TASK_NAME}")
+    print(f"Service : {SERVICE_NAME}.service")
     print()
 
-    # Build the XML-based task so we can set a 60-second startup delay
-    # and run whether or not the user is logged on.
-    task_xml = f"""<?xml version="1.0" encoding="UTF-16"?>
-<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo>
-    <Description>VLC video scheduler — plays videos at 13:00, 19:00 and 21:00</Description>
-  </RegistrationInfo>
-  <Triggers>
-    <LogonTrigger>
-      <Enabled>true</Enabled>
-      <Delay>PT1M</Delay>
-    </LogonTrigger>
-  </Triggers>
-  <Principals>
-    <Principal id="Author">
-      <LogonType>InteractiveToken</LogonType>
-      <RunLevel>LeastPrivilege</RunLevel>
-    </Principal>
-  </Principals>
-  <Settings>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
-    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
-    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
-    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
-    <RestartOnFailure>
-      <Interval>PT1M</Interval>
-      <Count>3</Count>
-    </RestartOnFailure>
-  </Settings>
-  <Actions Context="Author">
-    <Exec>
-      <Command>{PYTHONW_EXE}</Command>
-      <Arguments>"{SCRIPT}"</Arguments>
-      <WorkingDirectory>{SCRIPT.parent}</WorkingDirectory>
-    </Exec>
-  </Actions>
-</Task>"""
+    service_unit = f"""[Unit]
+Description=VLC Scheduler — plays videos at scheduled times
+After=graphical-session.target
 
-    xml_path = SCRIPT.parent / "_task_def.xml"
-    xml_path.write_text(task_xml, encoding="utf-16")
+[Service]
+Type=simple
+ExecStart={python_exe} {SCRIPT}
+WorkingDirectory={SCRIPT.parent}
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=default.target
+"""
+
+    SYSTEMD_DIR.mkdir(parents=True, exist_ok=True)
+    SERVICE_FILE.write_text(service_unit)
 
     result = subprocess.run(
-        ["schtasks", "/Create", "/F", "/TN", TASK_NAME, "/XML", str(xml_path)],
-        capture_output=True,
-        text=True,
+        ["systemctl", "--user", "daemon-reload"],
+        capture_output=True, text=True,
     )
-    xml_path.unlink(missing_ok=True)   # clean up temp file
+    if result.returncode != 0:
+        print("Failed to reload systemd daemon:")
+        print(result.stderr or result.stdout)
+        sys.exit(1)
 
+    result = subprocess.run(
+        ["systemctl", "--user", "enable", "--now", SERVICE_NAME],
+        capture_output=True, text=True,
+    )
     if result.returncode == 0:
-        print(f"Task '{TASK_NAME}' created successfully.")
+        print(f"Service '{SERVICE_NAME}' created and started successfully.")
         print("The VLC scheduler will start automatically at the next login.")
         print()
-        print("To start it right now without rebooting:")
-        print(f'    schtasks /Run /TN "{TASK_NAME}"')
+        print("Useful commands:")
+        print(f"    systemctl --user status {SERVICE_NAME}")
+        print(f"    systemctl --user stop   {SERVICE_NAME}")
+        print(f"    journalctl --user -u {SERVICE_NAME} -f")
     else:
-        print("Failed to create the task:")
+        print("Failed to enable the service:")
         print(result.stderr or result.stdout)
-        print()
-        print("Try running this script as Administrator:")
-        print("  Right-click Command Prompt → 'Run as administrator'")
-        print("  Then:  python setup_autostart.py")
 
 
-def delete_task() -> None:
-    result = subprocess.run(
-        ["schtasks", "/Delete", "/F", "/TN", TASK_NAME],
-        capture_output=True,
-        text=True,
+def delete_service() -> None:
+    subprocess.run(
+        ["systemctl", "--user", "disable", "--now", SERVICE_NAME],
+        capture_output=True, text=True,
     )
-    if result.returncode == 0:
-        print(f"Task '{TASK_NAME}' removed.")
-    else:
-        print("Could not remove task (it may not exist).")
-        print(result.stderr or result.stdout)
+    if SERVICE_FILE.exists():
+        SERVICE_FILE.unlink()
+    subprocess.run(
+        ["systemctl", "--user", "daemon-reload"],
+        capture_output=True, text=True,
+    )
+    print(f"Service '{SERVICE_NAME}' removed.")
 
 
 if __name__ == "__main__":
     if "--remove" in sys.argv:
-        delete_task()
+        delete_service()
     else:
-        create_task()
+        create_service()

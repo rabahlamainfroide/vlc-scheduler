@@ -9,7 +9,7 @@ Automatically plays the next numbered video from designated folders at scheduled
 - **State Persistence**: Remembers the last played video per folder, even after restarts
 - **Multiple Format Support**: Handles MP4, AVI, MKV, MOV, WMV, FLV, and more
 - **Logging**: All activities logged to file and console
-- **Windows Autostart**: Optional setup to run automatically on system boot
+- **Linux Autostart**: Optional systemd user service for automatic startup on login
 
 ## Installation
 
@@ -20,24 +20,30 @@ git clone <repository-url>
 cd vlc-scheduler
 ```
 
-### 2. Create Virtual Environment
-
-**On Windows:**
+### 2. Install VLC
 
 ```bash
-setup_venv.bat
+# Debian/Ubuntu
+sudo apt install vlc
+
+# Fedora
+sudo dnf install vlc
+
+# Arch
+sudo pacman -S vlc
 ```
 
-**On Linux/macOS:**
+### 3. Create Virtual Environment and Install Dependencies
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate
+bash setup_venv.sh
 ```
 
-### 3. Install Dependencies
+Or manually:
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
@@ -47,16 +53,16 @@ Edit `config.json` to set up your schedules:
 
 ```json
 {
-  "vlc_path": "C:/Program Files/VideoLAN/VLC/vlc.exe",
+  "vlc_path": "/usr/bin/vlc",
   "video_extensions": [".mp4", ".avi", ".mkv", ".mov", ".wmv"],
   "schedules": [
     {
       "time": "13:00",
-      "folder": "C:/path/to/videos/folder01"
+      "folder": "/home/user/videos/folder01"
     },
     {
       "time": "19:00",
-      "folder": "C:/path/to/videos/folder02"
+      "folder": "/home/user/videos/folder02"
     }
   ]
 }
@@ -64,7 +70,7 @@ Edit `config.json` to set up your schedules:
 
 ### Configuration Options
 
-- **vlc_path**: Full path to VLC executable
+- **vlc_path**: Full path to the VLC executable (usually `/usr/bin/vlc`)
 - **video_extensions**: List of video file extensions to recognize
 - **schedules**: Array of scheduled playback times and folders
   - **time**: Playback time in HH:MM format (24-hour)
@@ -80,24 +86,40 @@ python vlc_scheduler.py
 
 The scheduler will run continuously and play videos at the configured times. Press `Ctrl+C` to stop.
 
-### Windows Autostart Setup
+### Autostart Setup (systemd)
+
+Register the scheduler as a systemd user service so it starts automatically on login:
 
 ```bash
-setup_autostart.bat
+bash setup_autostart.sh
 ```
 
-This registers the scheduler to start automatically on system boot (Windows only).
+Or directly:
+
+```bash
+python setup_autostart.py           # install
+python setup_autostart.py --remove  # uninstall
+```
+
+Useful service commands:
+
+```bash
+systemctl --user status vlc-scheduler
+systemctl --user stop   vlc-scheduler
+systemctl --user start  vlc-scheduler
+journalctl --user -u vlc-scheduler -f
+```
 
 ## File Structure
 
-- `vlc_scheduler.py` - Main scheduler script
-- `config.json` - Configuration file
-- `playback_state.json` - Tracks current playback position per folder
-- `vlc_scheduler.log` - Log file (auto-created)
-- `requirements.txt` - Python dependencies
-- `setup_venv.bat` - Virtual environment setup (Windows)
-- `setup_autostart.bat` - Autostart setup (Windows)
-- `setup_autostart.py` - Autostart setup script helper
+- `vlc_scheduler.py` — Main scheduler script
+- `config.json` — Configuration file
+- `playback_state.json` — Tracks current playback position per folder
+- `vlc_scheduler.log` — Log file (auto-created)
+- `requirements.txt` — Python dependencies
+- `setup_venv.sh` — Virtual environment setup
+- `setup_autostart.sh` — Autostart setup wrapper
+- `setup_autostart.py` — Autostart setup script (systemd)
 
 ## Video Organization
 
@@ -120,7 +142,8 @@ folder01/
 
 **VLC not found:**
 
-- Verify the `vlc_path` in `config.json` points to the correct VLC executable
+- Check VLC is installed: `which vlc`
+- Verify the `vlc_path` in `config.json` matches the output of `which vlc`
 
 **Videos not playing:**
 

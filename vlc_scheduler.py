@@ -38,7 +38,7 @@ log = logging.getLogger(__name__)
 
 # ── Default configuration (written on first run) ──────────────────────────────
 DEFAULT_CONFIG = {
-    "vlc_path": "C:/Program Files/VideoLAN/VLC/vlc.exe",
+    "vlc_path": "/usr/bin/vlc",
     "video_extensions": [
         ".mp4", ".avi", ".mkv", ".mov", ".wmv", ".flv",
         ".m4v", ".mpg", ".mpeg", ".webm", ".ts", ".vob", ".mts", ".m2ts",
