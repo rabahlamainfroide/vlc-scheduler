@@ -14,24 +14,29 @@ Automatically plays the next numbered video from designated folders at scheduled
 ## Installation
 
 ### 1. Clone/Download the Project
+
 ```bash
 git clone <repository-url>
 cd vlc-scheduler
 ```
 
 ### 2. Create Virtual Environment
+
 **On Windows:**
+
 ```bash
 setup_venv.bat
 ```
 
 **On Linux/macOS:**
+
 ```bash
 python3 -m venv venv
 source venv/bin/activate
 ```
 
 ### 3. Install Dependencies
+
 ```bash
 pip install -r requirements.txt
 ```
@@ -68,6 +73,7 @@ Edit `config.json` to set up your schedules:
 ## Usage
 
 ### Run Scheduler
+
 ```bash
 python vlc_scheduler.py
 ```
@@ -75,6 +81,7 @@ python vlc_scheduler.py
 The scheduler will run continuously and play videos at the configured times. Press `Ctrl+C` to stop.
 
 ### Windows Autostart Setup
+
 ```bash
 setup_autostart.bat
 ```
@@ -107,13 +114,16 @@ folder01/
 ## Troubleshooting
 
 **Missing schedule module error:**
+
 - Ensure virtual environment is activated before running
 - Run `pip install -r requirements.txt`
 
 **VLC not found:**
+
 - Verify the `vlc_path` in `config.json` points to the correct VLC executable
 
 **Videos not playing:**
+
 - Check folder permissions
 - Ensure videos have supported extensions listed in config
 - Verify folder path exists and contains numbered videos
