@@ -106,6 +106,31 @@ PasswordAuthentication yes
 sudo systemctl restart ssh
 ```
 
+### Optional: Force audio output to HDMI
+
+Find the HDMI device:
+
+```bash
+aplay -l
+# Look for the HDMI entry — e.g. card 0, device 3: HDMI 0 [LG HDR 4K]
+```
+
+Create `/etc/asound.conf` with the card and device numbers:
+
+```
+defaults.pcm.card 0
+defaults.pcm.device 3
+defaults.ctl.card 0
+```
+
+Test:
+
+```bash
+speaker-test -c 2 -t wav
+```
+
+VLC picks up the ALSA default automatically — no VLC config needed.
+
 ### Optional: Control volume over SSH
 
 ```bash
