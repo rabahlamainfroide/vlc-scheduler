@@ -38,7 +38,7 @@ echo
 # ── 1. Install system packages ─────────────────────────────────────────────────
 echo "[1/5] Installing system packages ..."
 apt-get update -q
-apt-get install -y xorg openbox vlc python3 python3-schedule network-manager unclutter alsa-utils
+apt-get install -y xorg openbox vlc python3 python3-schedule network-manager unclutter alsa-utils intel-media-va-driver vainfo
 systemctl enable NetworkManager
 systemctl start NetworkManager
 echo "      Done."

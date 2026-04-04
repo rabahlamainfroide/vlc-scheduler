@@ -31,7 +31,7 @@ Use the netinstall ISO. In `tasksel`, select **SSH server only** — nothing els
 
 ```bash
 sudo apt install git
-git clone <repository-url> ~/vlc-scheduler
+git clone https://github.com/rabahlamainfroide/vlc-scheduler.git ~/vlc-scheduler
 cd ~/vlc-scheduler
 ```
 
@@ -42,7 +42,8 @@ sudo bash setup_kiosk.sh
 ```
 
 This single script handles everything:
-- Installs `xorg`, `vlc`, `python3`, `python3-schedule`, `network-manager`, `unclutter`, `alsa-utils`
+
+- Installs `xorg`, `openbox`, `vlc`, `python3`, `python3-schedule`, `network-manager`, `unclutter`, `alsa-utils`, `intel-media-va-driver`
 - Creates `/etc/X11/xorg.conf.d/10-no-blanking.conf` to persistently disable screen blanking
 - Configures **auto-login** on tty1
 - Configures **auto-start X** on login via `~/.bash_profile` (SSH sessions are excluded)
@@ -65,6 +66,7 @@ sudo reboot
 ```
 
 **Boot sequence after setup:**
+
 1. Machine powers on
 2. Debian boots → auto-login on tty1
 3. `~/.bash_profile` detects tty1 → runs `startx`
@@ -145,15 +147,15 @@ Edit `config.json`:
 }
 ```
 
-| Key | Description |
-|-----|-------------|
-| `vlc_path` | Path to VLC. `"auto"` detects it via `$PATH` |
-| `status_port` | Port for the status HTTP endpoint (default: `8765`) |
-| `video_extensions` | List of file extensions to recognise as videos |
-| `schedules[].time` | Playback time in `HH:MM` 24-hour format |
-| `schedules[].folder` | Full path to the folder containing numbered videos |
-| `schedules[].count` | Number of videos to play back-to-back (default: `1`) |
-| `schedules[].before_play` | Optional shell command to run before launching VLC |
+| Key                       | Description                                          |
+| ------------------------- | ---------------------------------------------------- |
+| `vlc_path`                | Path to VLC. `"auto"` detects it via `$PATH`         |
+| `status_port`             | Port for the status HTTP endpoint (default: `8765`)  |
+| `video_extensions`        | List of file extensions to recognise as videos       |
+| `schedules[].time`        | Playback time in `HH:MM` 24-hour format              |
+| `schedules[].folder`      | Full path to the folder containing numbered videos   |
+| `schedules[].count`       | Number of videos to play back-to-back (default: `1`) |
+| `schedules[].before_play` | Optional shell command to run before launching VLC   |
 
 Changes to `config.json` are picked up automatically within 30 seconds — no restart needed.
 
@@ -239,15 +241,25 @@ vlc-scheduler/
 **Missing `schedule` module:**
 Run `sudo apt install python3-schedule`.
 
+**Choppy video playback:**
+VLC uses OpenGL output (`--vout gl`) and hardware decoding (`--avcodec-hw any`) by default. Verify VA-API is working:
+```bash
+vainfo
+sudo intel_gpu_top  # Render/3D should show activity during playback
+```
+If `vainfo` fails, install the driver: `sudo apt install intel-media-va-driver`.
+
 **VLC not found:**
 `which vlc` — confirm it's installed and on `$PATH`. Or set `vlc_path` explicitly in `config.json`.
 
 **Videos not playing:**
+
 - Check that the folder path in `config.json` exists and is readable
 - Use `--dry-run` to verify the scheduler sees the correct files
 
 **Screen goes blank:**
 The kiosk setup disables DPMS automatically via `~/.xinitrc`. If you set up manually, run:
+
 ```bash
 xset s off && xset -dpms && xset s noblank
 ```
@@ -263,6 +275,7 @@ Run `alsamixer` via SSH and check that Master/PCM channels are unmuted (press `M
 
 **WiFi doesn't reconnect after reboot:**
 Verify with `nmcli con show` — your connection should have `autoconnect: yes`. If not:
+
 ```bash
 nmcli con mod "YourWiFiName" connection.autoconnect yes
 ```
