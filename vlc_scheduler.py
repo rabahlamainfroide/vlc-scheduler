@@ -206,8 +206,10 @@ def get_next_videos(folder_path: str, state: dict, extensions: list, count: int 
 
 def _run_hook(cmd: str) -> None:
     """Run an optional shell hook, logging errors without crashing."""
+    env = os.environ.copy()
+    env.setdefault("DISPLAY", ":0")
     try:
-        result = subprocess.run(cmd, shell=True, timeout=10)
+        result = subprocess.run(cmd, shell=True, timeout=10, env=env)
         if result.returncode != 0:
             log.warning(f"Hook exited {result.returncode}: {cmd!r}")
     except subprocess.TimeoutExpired:
