@@ -21,7 +21,7 @@ from typing import Optional
 try:
     import schedule
 except ImportError:
-    print("Missing dependency. Activate the venv and run:  pip install -r requirements.txt")
+    print("Missing dependency. Run:  sudo apt install python3-schedule")
     sys.exit(1)
 
 # ── Paths ─────────────────────────────────────────────────────────────────────

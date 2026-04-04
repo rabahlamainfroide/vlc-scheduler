@@ -1,63 +1,109 @@
 # VLC Scheduler
 
-Automatically plays the next numbered video(s) from designated folders at scheduled times. State is persisted so playback resumes from where it left off.
+Automatically plays the next numbered video(s) from designated folders at scheduled times. State is persisted so playback resumes from where it left off across reboots.
 
 ## Features
 
 - **Scheduled Playback**: Configure multiple folders with different playback times
-- **Sequential Playback**: Automatically plays numbered videos in order (e.g., 001.mp4, 002.mp4, etc.)
-- **Multi-video batches**: Play N videos back-to-back per schedule slot (great for short clips)
-- **State Persistence**: Remembers the last played video per folder, even after restarts
-- **Multiple Format Support**: Handles MP4, AVI, MKV, MOV, WMV, FLV, and more
+- **Sequential Playback**: Plays numbered videos in order (001.mp4, 002.mp4, …), wrapping around when the last one is reached
+- **Multi-video batches**: Play N videos back-to-back per schedule slot
+- **State Persistence**: Remembers the last played video per folder across restarts
+- **Multiple Format Support**: MP4, AVI, MKV, MOV, WMV, FLV, and more
 - **Auto VLC Detection**: Finds VLC automatically — no path configuration needed
-- **Stale VLC Cleanup**: Terminates any leftover VLC instance before starting a new one
-- **Pre-play Hooks**: Run a shell command before each playback (e.g. disable screensaver)
+- **Stale VLC Cleanup**: Kills any leftover VLC instance before starting a new one
+- **Pre-play Hooks**: Run a shell command before each playback (e.g. reset screensaver, set volume)
 - **Config Hot-reload**: Edit `config.json` while running — changes take effect within 30 s
 - **Status Endpoint**: Live JSON status at `http://127.0.0.1:8765/`
 - **Dry-run Mode**: Preview what would play without launching VLC
 - **Play-now CLI**: Trigger a folder immediately from the command line
-- **Logging**: All activity logged to file and console
-- **Linux Autostart**: Systemd user service for automatic startup on login
 
-## Installation
+---
 
-### 1. Clone/Download the Project
+## Kiosk Deployment (Debian 13 Minimal)
 
-```bash
-git clone <repository-url>
-cd vlc-scheduler
-```
+This is the primary deployment target: a headless Debian machine that boots directly into the scheduler with no desktop environment.
 
-### 2. Install VLC
+### 1. Install Debian 13 "Trixie"
 
-```bash
-# Debian/Ubuntu
-sudo apt install vlc
+Use the netinstall ISO. In `tasksel`, select **SSH server only** — nothing else.
 
-# Fedora
-sudo dnf install vlc
-
-# Arch
-sudo pacman -S vlc
-```
-
-### 3. Create Virtual Environment and Install Dependencies
+### 2. Connect via SSH and install the project
 
 ```bash
-bash setup_venv.sh
+sudo apt install git
+git clone <repository-url> ~/vlc-scheduler
+cd ~/vlc-scheduler
 ```
 
-Or manually:
+### 3. Run the kiosk setup script
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+sudo bash setup_kiosk.sh
 ```
+
+This single script handles everything:
+- Installs `xorg`, `vlc`, `python3`, `python3-schedule`
+- Configures **auto-login** on tty1
+- Configures **auto-start X** on login via `~/.bash_profile`
+- Creates `~/.xinitrc` that runs the scheduler (with auto-restart on crash)
+
+Screen blanking and DPMS power-save are disabled automatically — the display stays on.
+
+### 4. Configure your schedule
+
+```bash
+nano ~/vlc-scheduler/config.json
+```
+
+Set the correct folder paths and times (see [Configuration](#configuration) below).
+
+### 5. Reboot
+
+```bash
+sudo reboot
+```
+
+**Boot sequence after setup:**
+1. Machine powers on
+2. Debian boots → auto-login on tty1
+3. `~/.bash_profile` detects tty1 → runs `startx`
+4. `~/.xinitrc` starts → runs `vlc_scheduler.py` in a restart loop
+5. VLC plays videos at scheduled times, fullscreen
+
+### Optional: WiFi setup
+
+If using WiFi instead of ethernet:
+
+```bash
+sudo apt install wpasupplicant wireless-tools
+```
+
+Find your interface name (`ip a`), then edit `/etc/network/interfaces`:
+
+```
+auto wlan0
+iface wlan0 inet static
+  address 192.168.1.50
+  netmask 255.255.255.0
+  gateway 192.168.1.1
+  dns-nameservers 8.8.8.8
+  wpa-ssid "NetworkName"
+  wpa-psk "NetworkPassword"
+```
+
+```bash
+sudo systemctl restart networking
+```
+
+### Optional: Auto power-on after power loss
+
+Enable **"AC Power Recovery"** in the BIOS (Dell: press F2 on boot). The machine will turn itself back on after any power outage.
+
+---
 
 ## Configuration
 
-Edit `config.json` to set up your schedules:
+Edit `config.json`:
 
 ```json
 {
@@ -80,69 +126,65 @@ Edit `config.json` to set up your schedules:
 }
 ```
 
-### Configuration Options
-
 | Key | Description |
 |-----|-------------|
-| `vlc_path` | Path to VLC executable. `"auto"` detects it via `$PATH` |
+| `vlc_path` | Path to VLC. `"auto"` detects it via `$PATH` |
 | `status_port` | Port for the status HTTP endpoint (default: `8765`) |
-| `video_extensions` | List of video file extensions to recognise |
+| `video_extensions` | List of file extensions to recognise as videos |
 | `schedules[].time` | Playback time in `HH:MM` 24-hour format |
-| `schedules[].folder` | Full path to folder containing numbered videos |
+| `schedules[].folder` | Full path to the folder containing numbered videos |
 | `schedules[].count` | Number of videos to play back-to-back (default: `1`) |
 | `schedules[].before_play` | Optional shell command to run before launching VLC |
 
-### Pre-play Hook Examples
+Changes to `config.json` are picked up automatically within 30 seconds — no restart needed.
 
-```json
-"before_play": "xdg-screensaver reset"
+---
+
+## Video Organisation
+
+Name files with leading numbers so they sort correctly:
+
+```
+folder01/
+  ├── 001_title.mp4
+  ├── 002_title.mp4
+  └── 003_title.mp4
 ```
 
-```json
-"before_play": "amixer set Master 80%"
-```
+Any numeric prefix works: `001`, `01`, `1`, `ep01`, etc.
 
-```json
-"before_play": "notify-send 'VLC Scheduler' 'Starting playback'"
-```
+---
 
 ## Usage
 
-### Run Scheduler
+### Run manually (for testing)
 
 ```bash
-python vlc_scheduler.py
+cd ~/vlc-scheduler
+python3 vlc_scheduler.py
 ```
 
-The scheduler will run continuously and play videos at the configured times. Press `Ctrl+C` to stop.
+### Dry run
 
-### Dry Run
-
-Preview which video would play at each scheduled time without actually launching VLC:
+Preview what would play at each scheduled time without launching VLC:
 
 ```bash
-python vlc_scheduler.py --dry-run
+python3 vlc_scheduler.py --dry-run
 ```
 
-### Play Now
+### Play now
 
 Immediately trigger the next video(s) from a specific folder:
 
 ```bash
-python vlc_scheduler.py --play-now /home/user/videos/folder01
+python3 vlc_scheduler.py --play-now /home/user/videos/folder01
 ```
 
-The folder respects the `count` and `before_play` settings configured for that folder.
-
-### Status Endpoint
-
-While the scheduler is running, query live status:
+### Status endpoint
 
 ```bash
 curl http://127.0.0.1:8765/
 ```
-
-Example response:
 
 ```json
 {
@@ -152,83 +194,44 @@ Example response:
       "time": "13:00",
       "folder": "/home/user/videos/folder01",
       "count": 1,
-      "last_played": "003_intro.mp4"
+      "last_played": "003_title.mp4"
     }
   ]
 }
 ```
 
-### Config Hot-reload
-
-Edit and save `config.json` at any time while the scheduler is running. Changes are detected automatically within 30 seconds — no restart needed. Invalid configs are logged and skipped without disrupting the running scheduler.
-
-### Autostart Setup (systemd)
-
-Register the scheduler as a systemd user service so it starts automatically on login:
-
-```bash
-bash setup_autostart.sh
-```
-
-Or directly:
-
-```bash
-python setup_autostart.py           # install
-python setup_autostart.py --remove  # uninstall
-```
-
-Useful service commands:
-
-```bash
-systemctl --user status vlc-scheduler
-systemctl --user stop   vlc-scheduler
-systemctl --user start  vlc-scheduler
-journalctl --user -u vlc-scheduler -f
-```
+---
 
 ## File Structure
 
-- `vlc_scheduler.py` — Main scheduler script
-- `config.json` — Configuration file
-- `playback_state.json` — Tracks current playback position per folder
-- `vlc_scheduler.log` — Log file (auto-created)
-- `requirements.txt` — Python dependencies
-- `setup_venv.sh` — Virtual environment setup
-- `setup_autostart.sh` — Autostart setup wrapper
-- `setup_autostart.py` — Autostart setup script (systemd)
-
-## Video Organization
-
-Videos should be named with leading numbers for sequential playback:
-
 ```
-folder01/
-  ├── 001_video_name.mp4
-  ├── 002_video_name.mp4
-  ├── 003_video_name.mp4
-  └── ...
+vlc-scheduler/
+├── vlc_scheduler.py       Main scheduler
+├── config.json            Schedule configuration
+├── playback_state.json    Tracks playback position per folder (auto-created)
+├── vlc_scheduler.log      Log file (auto-created)
+└── setup_kiosk.sh         Full kiosk setup for Debian minimal
 ```
+
+---
 
 ## Troubleshooting
 
-**Missing `schedule` module error:**
-Activate the virtual environment and run `pip install -r requirements.txt`.
+**Missing `schedule` module:**
+Run `sudo apt install python3-schedule`.
 
 **VLC not found:**
-Run `which vlc` to confirm VLC is installed and on `$PATH`. If it's in a non-standard location, set `vlc_path` explicitly in `config.json`.
+`which vlc` — confirm it's installed and on `$PATH`. Or set `vlc_path` explicitly in `config.json`.
 
 **Videos not playing:**
-- Check folder permissions
-- Ensure videos have supported extensions listed in config
+- Check that the folder path in `config.json` exists and is readable
 - Use `--dry-run` to verify the scheduler sees the correct files
 
+**Screen goes blank:**
+The kiosk setup disables DPMS automatically via `~/.xinitrc`. If you set up manually, run:
+```bash
+xset s off && xset -dpms && xset s noblank
+```
+
 **Status endpoint not responding:**
-Change `status_port` in `config.json` if port 8765 is already in use.
-
-## License
-
-[Add your license here]
-
-## Contributing
-
-Contributions welcome! Feel free to submit issues and pull requests.
+Change `status_port` in `config.json` if port 8765 is in use.
