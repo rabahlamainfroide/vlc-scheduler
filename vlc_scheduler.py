@@ -9,6 +9,7 @@ import argparse
 import http.server
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -249,6 +250,8 @@ def play_videos(folder_path: str, vlc_path: str, extensions: list,
         _run_hook(before_play)
 
     try:
+        env = os.environ.copy()
+        env.setdefault("DISPLAY", ":0")
         _active_proc = subprocess.Popen(
             [
                 vlc_path,
@@ -257,7 +260,8 @@ def play_videos(folder_path: str, vlc_path: str, extensions: list,
                 "--no-video-title-show",
                 "--vout", "xcb_xv",
                 *(str(v) for v in videos),
-            ]
+            ],
+            env=env,
         )
         # Persist state: record the last video in the batch as the new position
         state[folder_path] = videos[-1].name
