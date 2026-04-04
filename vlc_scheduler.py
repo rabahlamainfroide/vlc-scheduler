@@ -237,14 +237,12 @@ def play_videos(folder_path: str, vlc_path: str, extensions: list,
 
     log.info(f"Launching VLC → {names}")
 
-    # Kill any still-running VLC from a previous scheduled slot
-    if _active_proc is not None and _active_proc.poll() is None:
-        log.info("Terminating previous VLC instance before starting new one.")
-        _active_proc.terminate()
-        try:
-            _active_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            _active_proc.kill()
+    # Kill any running VLC — use pkill so it works across process boundaries
+    # (e.g. --play-now spawns a fresh process where _active_proc is always None)
+    result = subprocess.run(["pkill", "vlc"], capture_output=True)
+    if result.returncode == 0:
+        log.info("Killed existing VLC instance.")
+        time.sleep(1)
 
     # Pre-play hook (e.g. disable screensaver)
     if before_play:
@@ -260,7 +258,6 @@ def play_videos(folder_path: str, vlc_path: str, extensions: list,
                 "--fullscreen",
                 "--play-and-exit",
                 "--no-video-title-show",
-                "--vout", "xcb_xv",
                 *(str(v) for v in videos),
             ],
             env=env,
