@@ -38,7 +38,7 @@ echo
 # ── 1. Install system packages ─────────────────────────────────────────────────
 echo "[1/5] Installing system packages ..."
 apt-get update -q
-apt-get install -y xorg vlc python3 python3-schedule network-manager unclutter alsa-utils
+apt-get install -y xorg openbox vlc python3 python3-schedule network-manager unclutter alsa-utils
 systemctl enable NetworkManager
 systemctl start NetworkManager
 echo "      Done."
@@ -98,6 +98,9 @@ cat > "$USER_HOME/.xinitrc" << XINITRC
 xset s off
 xset s noblank
 xset -dpms
+
+# Window manager — required for VLC fullscreen hints to work
+openbox &
 
 # Hide mouse cursor after 3 seconds of inactivity
 unclutter -idle 3 &
