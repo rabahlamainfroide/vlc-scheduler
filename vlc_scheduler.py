@@ -255,6 +255,7 @@ def play_videos(folder_path: str, vlc_path: str, extensions: list,
                 "--fullscreen",
                 "--play-and-exit",
                 "--no-video-title-show",
+                "--vout", "xcb_xv",
                 *(str(v) for v in videos),
             ]
         )
