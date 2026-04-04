@@ -36,14 +36,30 @@ echo " Project : $SCRIPT_DIR"
 echo
 
 # ── 1. Install system packages ─────────────────────────────────────────────────
-echo "[1/4] Installing system packages ..."
+echo "[1/5] Installing system packages ..."
 apt-get update -q
-apt-get install -y xorg vlc python3 python3-schedule
+apt-get install -y xorg vlc python3 python3-schedule network-manager unclutter alsa-utils
+systemctl enable NetworkManager
+systemctl start NetworkManager
 echo "      Done."
 echo
 
-# ── 2. Configure auto-login on tty1 ───────────────────────────────────────────
-echo "[2/4] Configuring auto-login for '$USERNAME' on tty1 ..."
+# ── 2. Disable screen blanking persistently via Xorg config ───────────────────
+echo "[2/5] Disabling screen blanking (Xorg config) ..."
+mkdir -p /etc/X11/xorg.conf.d
+cat > /etc/X11/xorg.conf.d/10-no-blanking.conf << 'EOF'
+Section "ServerFlags"
+    Option "BlankTime"    "0"
+    Option "StandbyTime"  "0"
+    Option "SuspendTime"  "0"
+    Option "OffTime"      "0"
+EndSection
+EOF
+echo "      Done."
+echo
+
+# ── 3. Configure auto-login on tty1 ───────────────────────────────────────────
+echo "[3/5] Configuring auto-login for '$USERNAME' on tty1 ..."
 GETTY_DIR="/etc/systemd/system/getty@tty1.service.d"
 mkdir -p "$GETTY_DIR"
 cat > "$GETTY_DIR/autologin.conf" << EOF
@@ -55,15 +71,15 @@ systemctl daemon-reload
 echo "      Done."
 echo
 
-# ── 3. Configure auto-start X on tty1 login ───────────────────────────────────
-echo "[3/4] Configuring auto-start X ..."
+# ── 4. Configure auto-start X on tty1 login ───────────────────────────────────
+echo "[4/5] Configuring auto-start X ..."
 BASH_PROFILE="$USER_HOME/.bash_profile"
 
 if ! grep -q "vlc-scheduler-kiosk" "$BASH_PROFILE" 2>/dev/null; then
     cat >> "$BASH_PROFILE" << 'PROFILE'
 
-# vlc-scheduler-kiosk: start X automatically when logged in on tty1
-if [ -z "${DISPLAY:-}" ] && [ "$(tty)" = "/dev/tty1" ]; then
+# vlc-scheduler-kiosk: start X automatically when logged in on tty1 (not over SSH)
+if [ -z "$SSH_CONNECTION" ] && [ -z "${DISPLAY:-}" ] && [ "$(tty)" = "/dev/tty1" ]; then
     exec startx
 fi
 PROFILE
@@ -74,14 +90,17 @@ else
 fi
 echo
 
-# ── 4. Create .xinitrc to run the scheduler ────────────────────────────────────
-echo "[4/4] Creating ~/.xinitrc ..."
+# ── 5. Create .xinitrc to run the scheduler ────────────────────────────────────
+echo "[5/5] Creating ~/.xinitrc ..."
 cat > "$USER_HOME/.xinitrc" << XINITRC
 #!/bin/bash
-# Disable screen blanking and power management
+# Disable screen blanking and power management (belt-and-suspenders — xorg.conf.d is primary)
 xset s off
-xset -dpms
 xset s noblank
+xset -dpms
+
+# Hide mouse cursor after 3 seconds of inactivity
+unclutter -idle 3 &
 
 # Run VLC Scheduler — restart automatically if it ever crashes
 cd "$SCRIPT_DIR"

@@ -42,12 +42,13 @@ sudo bash setup_kiosk.sh
 ```
 
 This single script handles everything:
-- Installs `xorg`, `vlc`, `python3`, `python3-schedule`
+- Installs `xorg`, `vlc`, `python3`, `python3-schedule`, `network-manager`, `unclutter`, `alsa-utils`
+- Creates `/etc/X11/xorg.conf.d/10-no-blanking.conf` to persistently disable screen blanking
 - Configures **auto-login** on tty1
-- Configures **auto-start X** on login via `~/.bash_profile`
-- Creates `~/.xinitrc` that runs the scheduler (with auto-restart on crash)
+- Configures **auto-start X** on login via `~/.bash_profile` (SSH sessions are excluded)
+- Creates `~/.xinitrc` that runs the scheduler (with auto-restart on crash) and hides the mouse cursor
 
-Screen blanking and DPMS power-save are disabled automatically — the display stays on.
+Screen blanking and DPMS power-save are disabled via both Xorg config and runtime `xset` — the display stays on.
 
 ### 4. Configure your schedule
 
@@ -72,27 +73,45 @@ sudo reboot
 
 ### Optional: WiFi setup
 
-If using WiFi instead of ethernet:
+`setup_kiosk.sh` installs and enables NetworkManager. Connect with:
 
 ```bash
-sudo apt install wpasupplicant wireless-tools
+# Scan
+nmcli dev wifi list
+
+# Connect
+nmcli dev wifi connect "YourWiFiName" password "YourPassword"
+
+# Assign a static IP so SSH address never changes
+nmcli con mod "YourWiFiName" ipv4.addresses 192.168.1.50/24
+nmcli con mod "YourWiFiName" ipv4.gateway 192.168.1.1
+nmcli con mod "YourWiFiName" ipv4.dns "8.8.8.8 1.1.1.1"
+nmcli con mod "YourWiFiName" ipv4.method manual
+nmcli con up "YourWiFiName"
 ```
 
-Find your interface name (`ip a`), then edit `/etc/network/interfaces`:
+NetworkManager auto-reconnects on reboot — no manual `/etc/network/interfaces` editing needed.
 
-```
-auto wlan0
-iface wlan0 inet static
-  address 192.168.1.50
-  netmask 255.255.255.0
-  gateway 192.168.1.1
-  dns-nameservers 8.8.8.8
-  wpa-ssid "NetworkName"
-  wpa-psk "NetworkPassword"
-```
+### Optional: Harden SSH
+
+Disable root login over SSH:
 
 ```bash
-sudo systemctl restart networking
+# Edit /etc/ssh/sshd_config
+PermitRootLogin no
+PasswordAuthentication yes
+
+sudo systemctl restart ssh
+```
+
+### Optional: Control volume over SSH
+
+```bash
+# Set master volume to 80%
+amixer set Master 80%
+
+# Interactive mixer
+alsamixer
 ```
 
 ### Optional: Auto power-on after power loss
@@ -235,3 +254,15 @@ xset s off && xset -dpms && xset s noblank
 
 **Status endpoint not responding:**
 Change `status_port` in `config.json` if port 8765 is in use.
+
+**Mouse cursor visible on screen:**
+Make sure `unclutter` is installed (`apt install unclutter`) and the `~/.xinitrc` was created by `setup_kiosk.sh`.
+
+**No sound:**
+Run `alsamixer` via SSH and check that Master/PCM channels are unmuted (press `M` to toggle). Use `aplay -l` to list sound devices.
+
+**WiFi doesn't reconnect after reboot:**
+Verify with `nmcli con show` — your connection should have `autoconnect: yes`. If not:
+```bash
+nmcli con mod "YourWiFiName" connection.autoconnect yes
+```
