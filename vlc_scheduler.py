@@ -388,9 +388,14 @@ class _StatusHandler(http.server.BaseHTTPRequestHandler):
         pass  # suppress per-request access log noise
 
 
+class _ReusePortHTTPServer(http.server.HTTPServer):
+    allow_reuse_address = True
+    allow_reuse_port    = True
+
+
 def _start_status_server(port: int) -> None:
     try:
-        server = http.server.HTTPServer(("127.0.0.1", port), _StatusHandler)
+        server = _ReusePortHTTPServer(("127.0.0.1", port), _StatusHandler)
         log.info(f"Status endpoint: http://127.0.0.1:{port}/")
         server.serve_forever()
     except OSError as e:
