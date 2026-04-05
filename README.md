@@ -237,6 +237,32 @@ Immediately trigger the next video(s) from a specific folder:
 python3 vlc_scheduler.py --play-now /home/user/videos/folder01
 ```
 
+### Peek at a scheduled time
+
+Show which video(s) would be played at a given time without changing state:
+
+```bash
+python3 vlc_scheduler.py --peek 19:00
+# Schedule 19:00  →  folder: /home/user/videos/series_A
+#   003_episode.mp4
+#   004_episode.mp4
+#   005_episode.mp4
+```
+
+### Simulate a playback
+
+Advance the state as if the scheduler played once at a given time (no VLC launched):
+
+```bash
+python3 vlc_scheduler.py --advance 19:00
+# Simulated playback at 19:00  →  folder: /home/user/videos/series_A
+#   003_episode.mp4
+#   ...
+# State updated.
+```
+
+Useful for skipping videos or fast-forwarding through the sequence during testing.
+
 ### Status endpoint
 
 ```bash

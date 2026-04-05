@@ -444,6 +444,14 @@ def main() -> None:
         "--play-now", metavar="FOLDER",
         help="Immediately play the next video(s) from FOLDER and exit",
     )
+    parser.add_argument(
+        "--peek", metavar="HH:MM",
+        help="Show which video(s) would be played at the given scheduled time, without changing state",
+    )
+    parser.add_argument(
+        "--advance", metavar="HH:MM",
+        help="Simulate one playback at the given scheduled time: advance state without launching VLC",
+    )
     args = parser.parse_args()
     _dry_run = args.dry_run
 
@@ -473,6 +481,40 @@ def main() -> None:
         )
         fes = get_folder_entries(entry) if entry else [{"path": args.play_now, "count": 1}]
         play_videos(fes, vlc_path, extensions, (entry or {}).get("before_play"))
+        return
+
+    # --peek: show next video(s) for a scheduled time without changing state
+    if args.peek:
+        entry = next((e for e in config["schedules"] if e["time"] == args.peek), None)
+        if not entry:
+            print(f"No schedule found for time: {args.peek}")
+            sys.exit(1)
+        fes    = get_folder_entries(entry)
+        state  = load_state()
+        videos, folder_index, folder_path = get_next_videos(fes, state, extensions)
+        print(f"Schedule {args.peek}  →  folder: {folder_path}")
+        for v in videos:
+            print(f"  {v.name}")
+        return
+
+    # --advance: advance state as if one playback ran at a scheduled time
+    if args.advance:
+        entry = next((e for e in config["schedules"] if e["time"] == args.advance), None)
+        if not entry:
+            print(f"No schedule found for time: {args.advance}")
+            sys.exit(1)
+        fes    = get_folder_entries(entry)
+        state  = load_state()
+        videos, folder_index, folder_path = get_next_videos(fes, state, extensions)
+        if not videos:
+            print("No videos to advance.")
+            sys.exit(1)
+        state[fes[0]["path"]] = {"folder_index": folder_index, "last_played": videos[-1].name}
+        save_state(state)
+        print(f"Simulated playback at {args.advance}  →  folder: {folder_path}")
+        for v in videos:
+            print(f"  {v.name}")
+        print("State updated.")
         return
 
     # Status endpoint in a background daemon thread
