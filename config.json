@@ -20,20 +20,16 @@
   "schedules": [
     {
       "time": "13:00",
-      "folder": "/home/user/videos/folder01",
-      "count": 1,
-      "before_play": "xdg-screensaver reset"
+      "folders": [{ "path": "/home/chak/videos/hs", "count": 1 }],
+      "before_play": "xdg-screensaver reset ; amixer set Master 80%"
     },
     {
       "time": "19:00",
-      "folder": "/home/user/videos/folder02",
-      "count": 3,
-      "before_play": "xdg-screensaver reset"
-    },
-    {
-      "time": "21:00",
-      "folder": "/home/user/videos/folder03",
-      "count": 1
+      "folders": [
+        { "path": "/home/chak/videos/ms", "count": 2 },
+        { "path": "/home/chak/videos/wc", "count": 1 }
+      ],
+      "before_play": "xdg-screensaver reset ; amixer set Master 80%"
     }
   ]
 }
