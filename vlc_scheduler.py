@@ -57,11 +57,53 @@ DEFAULT_CONFIG = {
         ".m4v", ".mpg", ".mpeg", ".webm", ".ts", ".vob", ".mts", ".m2ts",
     ],
     "schedules": [
-        {"time": "17:30", "folder": str(BASE_DIR / "folder01"), "count": 1},
-        {"time": "19:00", "folder": str(BASE_DIR / "folder02"), "count": 1},
-        {"time": "21:00", "folder": str(BASE_DIR / "folder03"), "count": 1},
+        {
+            "time": "17:30",
+            "folders": [
+                {"path": str(BASE_DIR / "folder01"), "count": 1},
+            ],
+        },
+        {
+            "time": "19:00",
+            "folders": [
+                {"path": str(BASE_DIR / "folder02"), "count": 3},
+                {"path": str(BASE_DIR / "folder03"), "count": 1},
+            ],
+        },
     ],
 }
+
+
+# ── Config helpers ────────────────────────────────────────────────────────────
+
+def get_folder_entries(entry: dict) -> list:
+    """Return a normalised list of {"path": str, "count": int} dicts for a
+    schedule entry.  Supports three config shapes (old → new):
+
+      1. {"folder": "/p", "count": 2}
+         → [{"path": "/p", "count": 2}]
+
+      2. {"folders": ["/p1", "/p2"], "count": 2}
+         → [{"path": "/p1", "count": 2}, {"path": "/p2", "count": 2}]
+
+      3. {"folders": [{"path": "/p1", "count": 2}, {"path": "/p2", "count": 1}]}
+         → [{"path": "/p1", "count": 2}, {"path": "/p2", "count": 1}]
+    """
+    default_count = entry.get("count", 1)
+
+    if "folders" in entry:
+        raw = entry["folders"]
+        if not isinstance(raw, list):
+            raw = [raw]
+        result = []
+        for item in raw:
+            if isinstance(item, dict):
+                result.append({"path": str(item["path"]), "count": item.get("count", default_count)})
+            else:
+                result.append({"path": str(item), "count": default_count})
+        return result
+
+    return [{"path": str(entry.get("folder", "")), "count": default_count}]
 
 
 # ── VLC detection ─────────────────────────────────────────────────────────────
@@ -121,21 +163,22 @@ def validate_config(config: dict) -> bool:
     errors     = []
 
     for entry in config.get("schedules", []):
-        folder = Path(entry.get("folder", ""))
-        if not folder.exists():
-            errors.append(f"  Folder not found: {folder}")
-            continue
-        try:
-            has_videos = any(
-                f.suffix.lower() in ext_set
-                for f in folder.iterdir()
-                if f.is_file()
-            )
-        except PermissionError:
-            errors.append(f"  Permission denied reading: {folder}")
-            continue
-        if not has_videos:
-            errors.append(f"  No supported video files in: {folder}")
+        for fe in get_folder_entries(entry):
+            folder = Path(fe["path"])
+            if not folder.exists():
+                errors.append(f"  Folder not found: {folder}")
+                continue
+            try:
+                has_videos = any(
+                    f.suffix.lower() in ext_set
+                    for f in folder.iterdir()
+                    if f.is_file()
+                )
+            except PermissionError:
+                errors.append(f"  Permission denied reading: {folder}")
+                continue
+            if not has_videos:
+                errors.append(f"  No supported video files in: {folder}")
 
     if errors:
         log.error("Config validation failed:\n" + "\n".join(errors))
@@ -165,41 +208,79 @@ def _natural_sort_key(path: Path):
     return [int(c) if c.isdigit() else c.lower() for c in parts]
 
 
-def get_next_videos(folder_path: str, state: dict, extensions: list, count: int = 1) -> list:
+def get_next_videos(folder_entries: list, state: dict, extensions: list):
     """
-    Return up to *count* video Paths to play next in natural order, wrapping
-    around the folder if needed.  Returns [] if the folder is missing or empty.
+    Return (videos, folder_index, folder_path) for the next batch of videos to
+    play.  The number of videos is taken from folder_entries[folder_index]["count"].
+
+    Advances through folder_entries when one folder is exhausted, wrapping back
+    to index 0 after the last folder.
+
+    State is keyed by folder_entries[0]["path"] and holds:
+        {"folder_index": int, "last_played": str|None}
+    Old string-valued state entries are migrated automatically.
     """
-    folder = Path(folder_path)
-    if not folder.exists():
-        log.error(f"Folder not found: {folder_path}")
-        return []
+    state_key   = folder_entries[0]["path"]
+    entry_state = state.get(state_key, {})
+
+    # Migrate old format: {"key": "video.mp4"} → {"folder_index": 0, "last_played": "video.mp4"}
+    if isinstance(entry_state, str):
+        entry_state = {"folder_index": 0, "last_played": entry_state}
+
+    folder_index = entry_state.get("folder_index", 0) % len(folder_entries)
+    last_played  = entry_state.get("last_played")
 
     ext_set = {e.lower() for e in extensions}
-    videos  = sorted(
-        [f for f in folder.iterdir() if f.is_file() and f.suffix.lower() in ext_set],
-        key=_natural_sort_key,
-    )
 
-    if not videos:
-        log.error(f"No video files found in: {folder_path}")
-        return []
+    # Try each folder in sequence, starting from the current one
+    for _ in range(len(folder_entries)):
+        fe          = folder_entries[folder_index]
+        folder_path = fe["path"]
+        count       = fe["count"]
+        folder      = Path(folder_path)
 
-    last_played_name = state.get(folder_path)
-    next_index = 0
-    if last_played_name:
-        for i, f in enumerate(videos):
-            if f.name == last_played_name:
-                next_index = i + 1
-                break
+        if not folder.exists():
+            log.error(f"Folder not found: {folder_path} — skipping to next")
+            folder_index = (folder_index + 1) % len(folder_entries)
+            last_played  = None
+            continue
 
-    if next_index >= len(videos):
-        log.info(f"All videos played — wrapping back to the first for: {folder_path}")
+        videos = sorted(
+            [f for f in folder.iterdir() if f.is_file() and f.suffix.lower() in ext_set],
+            key=_natural_sort_key,
+        )
+
+        if not videos:
+            log.error(f"No video files in: {folder_path} — skipping to next")
+            folder_index = (folder_index + 1) % len(folder_entries)
+            last_played  = None
+            continue
+
         next_index = 0
+        if last_played:
+            for i, f in enumerate(videos):
+                if f.name == last_played:
+                    next_index = i + 1
+                    break
 
-    total    = len(videos)
-    selected = [videos[(next_index + offset) % total] for offset in range(count)]
-    return selected
+        if next_index >= len(videos):
+            # Current folder exhausted — advance to the next one
+            next_folder_index = (folder_index + 1) % len(folder_entries)
+            log.info(
+                f"All videos played in {folder_path}"
+                + (f" — advancing to {folder_entries[next_folder_index]['path']}"
+                   if len(folder_entries) > 1 else " — wrapping back to first")
+            )
+            folder_index = next_folder_index
+            last_played  = None
+            continue
+
+        total    = len(videos)
+        selected = [videos[(next_index + offset) % total] for offset in range(count)]
+        return selected, folder_index, folder_path
+
+    log.error("No playable videos found in any configured folder.")
+    return [], 0, folder_entries[0]["path"]
 
 
 # ── Hooks ─────────────────────────────────────────────────────────────────────
@@ -220,12 +301,12 @@ def _run_hook(cmd: str) -> None:
 
 # ── Playback ──────────────────────────────────────────────────────────────────
 
-def play_videos(folder_path: str, vlc_path: str, extensions: list,
-                count: int = 1, before_play: Optional[str] = None) -> None:
+def play_videos(folder_entries: list, vlc_path: str, extensions: list,
+                before_play: Optional[str] = None) -> None:
     global _active_proc
 
-    state  = load_state()
-    videos = get_next_videos(folder_path, state, extensions, count)
+    state                             = load_state()
+    videos, folder_index, folder_path = get_next_videos(folder_entries, state, extensions)
     if not videos:
         return
 
@@ -264,8 +345,8 @@ def play_videos(folder_path: str, vlc_path: str, extensions: list,
             ],
             env=env,
         )
-        # Persist state: record the last video in the batch as the new position
-        state[folder_path] = videos[-1].name
+        # Persist state: record which folder and the last video played
+        state[folder_entries[0]["path"]] = {"folder_index": folder_index, "last_played": videos[-1].name}
         save_state(state)
     except FileNotFoundError:
         log.error(f"VLC executable not found at: {vlc_path}  — update config.json")
@@ -278,17 +359,23 @@ def play_videos(folder_path: str, vlc_path: str, extensions: list,
 class _StatusHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         state   = load_state()
+        def _schedule_status(entry):
+            fes         = get_folder_entries(entry)
+            state_key   = fes[0]["path"]
+            entry_state = state.get(state_key, {})
+            if isinstance(entry_state, str):
+                entry_state = {"folder_index": 0, "last_played": entry_state}
+            folder_index = entry_state.get("folder_index", 0) % len(fes)
+            return {
+                "time":          entry["time"],
+                "folders":       fes,
+                "active_folder": fes[folder_index]["path"],
+                "last_played":   entry_state.get("last_played"),
+            }
+
         payload = {
             "vlc_running": _active_proc is not None and _active_proc.poll() is None,
-            "schedules": [
-                {
-                    "time":        entry["time"],
-                    "folder":      entry["folder"],
-                    "count":       entry.get("count", 1),
-                    "last_played": state.get(entry["folder"]),
-                }
-                for entry in _current_config.get("schedules", [])
-            ],
+            "schedules":   [_schedule_status(e) for e in _current_config.get("schedules", [])],
         }
         body = json.dumps(payload, indent=2).encode()
         self.send_response(200)
@@ -320,12 +407,12 @@ def _register_schedules(config: dict) -> None:
 
     for entry in config["schedules"]:
         t           = entry["time"]
-        folder      = entry["folder"]
-        count       = entry.get("count", 1)
+        fes         = get_folder_entries(entry)
         before_play = entry.get("before_play")
-        log.info(f"  Registered  {t}  →  {folder}  (count={count})")
+        for fe in fes:
+            log.info(f"  Registered  {t}  →  {fe['path']}  (count={fe['count']})")
         schedule.every().day.at(t).do(
-            play_videos, folder, vlc_path, extensions, count, before_play
+            play_videos, fes, vlc_path, extensions, before_play
         )
 
 
@@ -364,18 +451,14 @@ def main() -> None:
 
     # --play-now: fire immediately and exit
     if args.play_now:
-        # Reuse per-folder settings from config if the folder is listed there
+        # Find matching schedule entry (by folder path appearing anywhere in folders list)
         entry = next(
-            (e for e in config["schedules"] if e["folder"] == args.play_now),
-            {},
+            (e for e in config["schedules"]
+             if args.play_now in [fe["path"] for fe in get_folder_entries(e)]),
+            None,
         )
-        play_videos(
-            args.play_now,
-            vlc_path,
-            extensions,
-            entry.get("count", 1),
-            entry.get("before_play"),
-        )
+        fes = get_folder_entries(entry) if entry else [{"path": args.play_now, "count": 1}]
+        play_videos(fes, vlc_path, extensions, (entry or {}).get("before_play"))
         return
 
     # Status endpoint in a background daemon thread

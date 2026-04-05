@@ -5,9 +5,9 @@ Automatically plays the next numbered video(s) from designated folders at schedu
 ## Features
 
 - **Scheduled Playback**: Configure multiple folders with different playback times
-- **Sequential Playback**: Plays numbered videos in order (001.mp4, 002.mp4, …), wrapping around when the last one is reached
-- **Multi-video batches**: Play N videos back-to-back per schedule slot
-- **State Persistence**: Remembers the last played video per folder across restarts
+- **Sequential Playback**: Plays numbered videos in order (001.mp4, 002.mp4, …); when a folder is exhausted it advances to the next folder in the list, wrapping back to the first after the last
+- **Multi-video batches**: Play N videos back-to-back per schedule slot, with a per-folder count
+- **State Persistence**: Remembers the last played video and active folder across restarts
 - **Multiple Format Support**: MP4, AVI, MKV, MOV, WMV, FLV, and more
 - **Auto VLC Detection**: Finds VLC automatically — no path configuration needed
 - **Stale VLC Cleanup**: Kills any leftover VLC instance before starting a new one
@@ -159,28 +159,39 @@ Edit `config.json`:
   "schedules": [
     {
       "time": "13:00",
-      "folder": "/home/user/videos/folder01",
-      "count": 1,
+      "folders": [
+        {"path": "/home/user/videos/folder01", "count": 1}
+      ],
       "before_play": "xdg-screensaver reset"
     },
     {
       "time": "19:00",
-      "folder": "/home/user/videos/folder02",
-      "count": 3
+      "folders": [
+        {"path": "/home/user/videos/series_A", "count": 3},
+        {"path": "/home/user/videos/series_B", "count": 1}
+      ]
     }
   ]
 }
 ```
 
-| Key                       | Description                                          |
-| ------------------------- | ---------------------------------------------------- |
-| `vlc_path`                | Path to VLC. `"auto"` detects it via `$PATH`         |
-| `status_port`             | Port for the status HTTP endpoint (default: `8765`)  |
-| `video_extensions`        | List of file extensions to recognise as videos       |
-| `schedules[].time`        | Playback time in `HH:MM` 24-hour format              |
-| `schedules[].folder`      | Full path to the folder containing numbered videos   |
-| `schedules[].count`       | Number of videos to play back-to-back (default: `1`) |
-| `schedules[].before_play` | Optional shell command to run before launching VLC   |
+| Key                              | Description                                                                                     |
+| -------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `vlc_path`                       | Path to VLC. `"auto"` detects it via `$PATH`                                                   |
+| `status_port`                    | Port for the status HTTP endpoint (default: `8765`)                                             |
+| `video_extensions`               | List of file extensions to recognise as videos                                                  |
+| `schedules[].time`               | Playback time in `HH:MM` 24-hour format                                                         |
+| `schedules[].folders`            | Ordered list of folder objects. When a folder's videos are all played, the next folder is used  |
+| `schedules[].folders[].path`     | Full path to the folder containing numbered videos                                              |
+| `schedules[].folders[].count`    | Number of videos to play back-to-back from this folder (default: `1`)                          |
+| `schedules[].before_play`        | Optional shell command to run before launching VLC                                              |
+
+**Backward-compatible formats** — the old `"folder"` string key and plain string lists still work:
+
+```json
+{ "time": "17:30", "folder": "/path/to/folder", "count": 2 }
+{ "time": "17:30", "folders": ["/path/a", "/path/b"], "count": 1 }
+```
 
 Changes to `config.json` are picked up automatically within 30 seconds — no restart needed.
 
@@ -238,8 +249,11 @@ curl http://127.0.0.1:8765/
   "schedules": [
     {
       "time": "13:00",
-      "folder": "/home/user/videos/folder01",
-      "count": 1,
+      "folders": [
+        {"path": "/home/user/videos/series_A", "count": 3},
+        {"path": "/home/user/videos/series_B", "count": 1}
+      ],
+      "active_folder": "/home/user/videos/series_A",
       "last_played": "003_title.mp4"
     }
   ]
