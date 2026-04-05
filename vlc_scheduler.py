@@ -394,12 +394,21 @@ class _ReusePortHTTPServer(http.server.HTTPServer):
 
 
 def _start_status_server(port: int) -> None:
-    try:
-        server = _ReusePortHTTPServer(("127.0.0.1", port), _StatusHandler)
-        log.info(f"Status endpoint: http://127.0.0.1:{port}/")
-        server.serve_forever()
-    except OSError as e:
-        log.warning(f"Could not start status server on port {port}: {e}")
+    for attempt in range(2):
+        try:
+            server = _ReusePortHTTPServer(("127.0.0.1", port), _StatusHandler)
+            log.info(f"Status endpoint: http://127.0.0.1:{port}/")
+            server.serve_forever()
+            return
+        except OSError:
+            if attempt == 0:
+                # Another instance is holding the port — release it and retry
+                log.info(f"Port {port} in use — releasing it and retrying.")
+                subprocess.run(["fuser", "-k", f"{port}/tcp"],
+                               capture_output=True)
+                time.sleep(1)
+            else:
+                log.warning(f"Could not start status server on port {port} — continuing without it.")
 
 
 # ── Schedule registration ─────────────────────────────────────────────────────
