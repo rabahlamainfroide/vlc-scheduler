@@ -94,17 +94,119 @@ nmcli con up "YourWiFiName"
 
 NetworkManager auto-reconnects on reboot — no manual `/etc/network/interfaces` editing needed.
 
-### Optional: Harden SSH
+### Optional: Harden SSH (key-only, no passwords)
 
-Disable root login over SSH:
+First copy your public key from your workstation:
 
 ```bash
-# Edit /etc/ssh/sshd_config
-PermitRootLogin no
-PasswordAuthentication yes
+ssh-copy-id chak@192.168.1.50
+# or manually append ~/.ssh/id_ed25519.pub to ~/.ssh/authorized_keys on the server
+```
 
+Then edit `/etc/ssh/sshd_config` on the server:
+
+```
+PermitRootLogin no
+PasswordAuthentication no
+```
+
+```bash
 sudo systemctl restart ssh
 ```
+
+Open a second SSH session to confirm key login works before closing the first.
+
+### Optional: Dynamic DNS (required if your ISP assigns a dynamic IP)
+
+If your public IP changes, clients can't reach the server by IP. Use a free DDNS service like [DuckDNS](https://www.duckdns.org) to get a stable hostname (e.g. `mykiosk.duckdns.org`) that always points to your current IP.
+
+**Install the DuckDNS updater as a cron job:**
+
+```bash
+mkdir -p ~/duckdns
+cat > ~/duckdns/duck.sh <<'EOF'
+echo url="https://www.duckdns.org/update?domains=YOURSUBDOMAIN&token=YOURTOKEN&ip=" | curl -k -o ~/duckdns/duck.log -K -
+EOF
+chmod +x ~/duckdns/duck.sh
+```
+
+Add to crontab (`crontab -e`):
+
+```
+*/5 * * * * ~/duckdns/duck.sh >/dev/null 2>&1
+```
+
+Replace `YOURSUBDOMAIN` and `YOURTOKEN` with the values from your DuckDNS account. The IP updates every 5 minutes.
+
+Also forward UDP port `51820` on your router to the machine's local IP.
+
+### Optional: WireGuard VPN server
+
+Lets you reach the machine remotely without exposing SSH to the public internet — SSH only over the VPN tunnel.
+
+**Install:**
+
+```bash
+sudo apt install wireguard
+```
+
+**Generate server keys:**
+
+```bash
+wg genkey | tee /etc/wireguard/server_private.key | wg pubkey > /etc/wireguard/server_public.key
+chmod 600 /etc/wireguard/server_private.key
+```
+
+**Create `/etc/wireguard/wg0.conf`:**
+
+```ini
+[Interface]
+Address = 10.0.0.1/24
+ListenPort = 51820
+PrivateKey = <contents of server_private.key>
+PostUp   = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+
+[Peer]
+PublicKey = <client public key>
+AllowedIPs = 10.0.0.2/32
+```
+
+Replace `eth0` with your actual network interface (`ip link` to check).
+
+**Enable IP forwarding:**
+
+```bash
+echo "net.ipv4.ip_forward=1" | sudo tee -a /etc/sysctl.conf
+sudo sysctl -p
+```
+
+**Start and enable at boot:**
+
+```bash
+sudo systemctl enable --now wg-quick@wg0
+```
+
+**Generate a client config** (run on the server, copy to client):
+
+```bash
+wg genkey | tee client_private.key | wg pubkey > client_public.key
+```
+
+```ini
+[Interface]
+Address = 10.0.0.2/24
+PrivateKey = <contents of client_private.key>
+DNS = 1.1.1.1
+
+[Peer]
+PublicKey = <contents of server_public.key>
+Endpoint = mykiosk.duckdns.org:51820
+AllowedIPs = 10.0.0.0/24
+PersistentKeepalive = 25
+```
+
+Add the client's public key to the `[Peer]` block in `wg0.conf`, then reload: `sudo wg syncconf wg0 <(wg-quick strip wg0)`.
 
 ### Optional: Force audio output to HDMI
 
@@ -139,6 +241,92 @@ amixer set Master 80%
 
 # Interactive mixer
 alsamixer
+```
+
+### Optional: Mount an external hard drive at a fixed path
+
+If your videos live on an external drive, mount it persistently so the path in `config.json` never changes between reboots.
+
+Find the drive's UUID:
+
+```bash
+sudo blkid
+# /dev/sdb1: UUID="FC3A-F72A" TYPE="vfat" ...
+```
+
+Add an entry to `/etc/fstab`:
+
+```
+UUID=FC3A-F72A  /home/chak/videos  vfat  defaults,nofail,x-systemd.automount,x-systemd.device-timeout=5  0  0
+```
+
+- `nofail` — boot succeeds even if the drive is absent
+- `x-systemd.automount` — mount is deferred until first access (avoids blocking boot)
+- `x-systemd.device-timeout=5` — gives up waiting for the device after 5 seconds
+
+Create the mount point and apply:
+
+```bash
+sudo mkdir -p /home/chak/videos
+sudo mount -a
+```
+
+### Optional: Debug an Android phone over USB
+
+Lets you run `adb` commands on a plugged-in Android phone — the phone owner just plugs in the cable.
+
+**One-time setup on the Debian machine:**
+
+```bash
+sudo apt install adb
+```
+
+Add a udev rule so `adb` works without `sudo`:
+
+```bash
+sudo tee /etc/udev/rules.d/51-android.rules <<'EOF'
+SUBSYSTEM=="usb", ATTR{idVendor}=="*", MODE="0664", GROUP="plugdev"
+EOF
+sudo usermod -aG plugdev $USER
+sudo udevadm control --reload-rules
+```
+
+Log out and back in for the group change to take effect.
+
+**One-time setup on the phone** (do this once while you're with the phone):
+
+1. Go to **Settings → About phone** and tap **Build number** 7 times to enable Developer Options
+2. Go to **Settings → Developer Options** and enable **USB debugging**
+3. Plug the phone into the machine and run:
+
+```bash
+adb devices
+```
+
+4. A prompt appears on the phone screen — tap **Allow** and check **Always allow from this computer**
+
+From that point on, plugging the cable in is all that's needed. Verify with:
+
+```bash
+adb devices
+# List of devices attached
+# XXXXXXXX    device
+```
+
+**Useful commands:**
+
+```bash
+# Take a screenshot and pull it to the machine
+adb shell screencap /sdcard/screen.png && adb pull /sdcard/screen.png
+
+# Stream phone logs live
+adb logcat
+
+# Install an APK
+adb install app.apk
+
+# Copy a file from the phone
+adb pull /sdcard/DCIM/photo.jpg .
 ```
 
 ### Optional: Auto power-on after power loss
