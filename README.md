@@ -329,6 +329,40 @@ adb install app.apk
 adb pull /sdcard/DCIM/photo.jpg .
 ```
 
+### Optional: Download series episodes remotely with yt-dlp
+
+Install yt-dlp (the apt package can be outdated — the binary from GitHub is always current):
+
+```bash
+sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+sudo chmod a+rx /usr/local/bin/yt-dlp
+```
+
+**Download a playlist directly into a scheduler folder**, with numbering the scheduler can read:
+
+```bash
+yt-dlp \
+  -o "/home/chak/videos/series_A/%(playlist_index)03d_%(title)s.%(ext)s" \
+  --merge-output-format mp4 \
+  "https://www.youtube.com/playlist?list=PLAYLIST_ID"
+```
+
+- `%(playlist_index)03d` — zero-padded episode number (001, 002, …) so the scheduler picks them up in order
+- `--merge-output-format mp4` — ensures the output is always `.mp4`
+
+**Run it from your laptop over SSH** so the download happens on the kiosk machine (no need to transfer files):
+
+```bash
+ssh chak@mykiosk.duckdns.org \
+  "yt-dlp -o '/home/chak/videos/series_A/%(playlist_index)03d_%(title)s.%(ext)s' --merge-output-format mp4 'PLAYLIST_URL'"
+```
+
+**Keep yt-dlp up to date:**
+
+```bash
+sudo yt-dlp -U
+```
+
 ### Optional: Auto power-on after power loss
 
 Enable **"AC Power Recovery"** in the BIOS (Dell: press F2 on boot). The machine will turn itself back on after any power outage.
