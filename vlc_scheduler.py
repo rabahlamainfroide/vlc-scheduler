@@ -452,6 +452,10 @@ def main() -> None:
         "--advance", metavar="HH:MM",
         help="Simulate one playback at the given scheduled time: advance state without launching VLC",
     )
+    parser.add_argument(
+        "--play-file", metavar="FILE",
+        help="Immediately play a specific video file and exit (does not affect playback state)",
+    )
     args = parser.parse_args()
     _dry_run = args.dry_run
 
@@ -515,6 +519,29 @@ def main() -> None:
         for v in videos:
             print(f"  {v.name}")
         print("State updated.")
+        return
+
+    # --play-file: play one specific file immediately and exit
+    if args.play_file:
+        file_path = Path(args.play_file)
+        if not file_path.is_file():
+            print(f"File not found: {args.play_file}")
+            sys.exit(1)
+        subprocess.run(["pkill", "vlc"], capture_output=True)
+        env = os.environ.copy()
+        env.setdefault("DISPLAY", ":0")
+        subprocess.Popen(
+            [
+                vlc_path,
+                "--fullscreen",
+                "--play-and-exit",
+                "--no-video-title-show",
+                "--vout", "gl",
+                "--avcodec-hw", "any",
+                str(file_path),
+            ],
+            env=env,
+        ).wait()
         return
 
     # Status endpoint in a background daemon thread

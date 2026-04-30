@@ -206,7 +206,59 @@ AllowedIPs = 10.0.0.0/24
 PersistentKeepalive = 25
 ```
 
+`AllowedIPs = 10.0.0.0/24` is **split tunneling** — only traffic destined for the VPN subnet (`10.0.0.x`) goes through the tunnel; your regular internet traffic continues over your normal connection. This is what you want here: SSH into `10.0.0.1`, everything else is unaffected.
+
+To route **all** traffic through the VPN instead (no split tunneling), change it to:
+
+```ini
+AllowedIPs = 0.0.0.0/0, ::/0
+```
+
 Add the client's public key to the `[Peer]` block in `wg0.conf`, then reload: `sudo wg syncconf wg0 <(wg-quick strip wg0)`.
+
+**Client setup — install WireGuard and activate the tunnel:**
+
+Save the config above as `wg0.conf` on the client, then:
+
+*Linux (Debian/Ubuntu):*
+```bash
+sudo apt install wireguard
+sudo cp wg0.conf /etc/wireguard/wg0.conf
+sudo chmod 600 /etc/wireguard/wg0.conf
+sudo wg-quick up wg0          # connect
+sudo wg-quick down wg0        # disconnect
+sudo systemctl enable wg-quick@wg0   # auto-connect at boot (optional)
+```
+
+*macOS (Homebrew):*
+```bash
+brew install wireguard-tools
+sudo wg-quick up ./wg0.conf
+sudo wg-quick down ./wg0.conf
+```
+Or install the **WireGuard** app from the Mac App Store — import the `.conf` file from the app.
+
+*Windows:* Download and install the [WireGuard app](https://www.wireguard.com/install/), click **Import tunnel(s) from file**, and select your `wg0.conf`. Toggle the tunnel on/off from the app.
+
+*Android / iOS:* Install the **WireGuard** app, tap **+**, and choose **Create from file or archive** to import the `.conf`, or scan a QR code. Generate a QR code from the server:
+
+```bash
+sudo apt install qrencode
+qrencode -t ansiutf8 < wg0.conf
+```
+
+**Verify the tunnel is up:**
+
+```bash
+# On the client — should show handshake timestamp and traffic counters
+sudo wg show
+
+# Confirm you can reach the server over the VPN
+ping 10.0.0.1
+
+# Then SSH as normal, using the VPN IP
+ssh chak@10.0.0.1
+```
 
 ### Optional: Force audio output to HDMI
 
@@ -453,11 +505,21 @@ python3 vlc_scheduler.py --dry-run
 
 ### Play now
 
-Immediately trigger the next video(s) from a specific folder:
+Immediately trigger the next video(s) from a specific folder (picks up where state left off):
 
 ```bash
 python3 vlc_scheduler.py --play-now /home/user/videos/folder01
 ```
+
+### Play a specific file
+
+Play one exact file right now, fullscreen, without touching playback state:
+
+```bash
+python3 vlc_scheduler.py --play-file /home/user/videos/folder01/003_episode.mp4
+```
+
+Useful for previewing a file or re-watching something without disrupting the scheduler's position.
 
 ### Peek at a scheduled time
 
