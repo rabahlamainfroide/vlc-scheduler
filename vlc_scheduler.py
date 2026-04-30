@@ -344,6 +344,7 @@ def play_videos(folder_entries: list, vlc_path: str, extensions: list,
                 *(str(v) for v in videos),
             ],
             env=env,
+            stderr=subprocess.DEVNULL,
         )
         # Persist state: record which folder and the last video played
         state[folder_entries[0]["path"]] = {"folder_index": folder_index, "last_played": videos[-1].name}
@@ -541,6 +542,7 @@ def main() -> None:
                 str(file_path),
             ],
             env=env,
+            stderr=subprocess.DEVNULL,
         ).wait()
         return
 
