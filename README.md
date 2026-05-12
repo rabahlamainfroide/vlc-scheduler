@@ -5,9 +5,10 @@ Automatically plays the next numbered video(s) from designated folders at schedu
 ## Features
 
 - **Scheduled Playback**: Configure multiple folders with different playback times
+- **Time-window scheduling**: Set a `start_time` + `end_time` and the scheduler automatically calculates how many episodes are needed to fill the slot. The overshoot is tracked so the next session seeks into the first episode to stay perfectly aligned across days
 - **Sequential Playback**: Plays numbered videos in order (001.mp4, 002.mp4, …); when a folder is exhausted it advances to the next folder in the list, wrapping back to the first after the last
 - **Multi-video batches**: Play N videos back-to-back per schedule slot, with a per-folder count
-- **State Persistence**: Remembers the last played video and active folder across restarts
+- **State Persistence**: Remembers the last played video, active folder, and session overshoot offset across restarts
 - **Multiple Format Support**: MP4, AVI, MKV, MOV, WMV, FLV, and more
 - **Auto VLC Detection**: Finds VLC automatically — no path configuration needed
 - **Stale VLC Cleanup**: Kills any leftover VLC instance before starting a new one
@@ -433,16 +434,17 @@ Edit `config.json`:
   "schedules": [
     {
       "time": "13:00",
+      "end_time": "14:30",
       "folders": [
-        {"path": "/home/user/videos/folder01", "count": 1}
+        {"path": "/home/user/videos/series_A"}
       ],
       "before_play": "xdg-screensaver reset"
     },
     {
       "time": "19:00",
       "folders": [
-        {"path": "/home/user/videos/series_A", "count": 3},
-        {"path": "/home/user/videos/series_B", "count": 1}
+        {"path": "/home/user/videos/series_B", "count": 3},
+        {"path": "/home/user/videos/series_C", "count": 1}
       ]
     }
   ]
@@ -454,10 +456,11 @@ Edit `config.json`:
 | `vlc_path`                       | Path to VLC. `"auto"` detects it via `$PATH`                                                   |
 | `status_port`                    | Port for the status HTTP endpoint (default: `8765`)                                             |
 | `video_extensions`               | List of file extensions to recognise as videos                                                  |
-| `schedules[].time`               | Playback time in `HH:MM` 24-hour format                                                         |
+| `schedules[].time`               | Start time in `HH:MM` 24-hour format                                                            |
+| `schedules[].end_time`           | Optional end time in `HH:MM`. When set, `count` is ignored — the scheduler uses `ffprobe` to measure episode durations and selects however many episodes are needed to fill the window. Requires `ffmpeg` to be installed. |
 | `schedules[].folders`            | Ordered list of folder objects. When a folder's videos are all played, the next folder is used  |
 | `schedules[].folders[].path`     | Full path to the folder containing numbered videos                                              |
-| `schedules[].folders[].count`    | Number of videos to play back-to-back from this folder (default: `1`)                          |
+| `schedules[].folders[].count`    | Number of videos to play back-to-back (default: `1`). Ignored when `end_time` is set           |
 | `schedules[].before_play`        | Optional shell command to run before launching VLC                                              |
 
 **Backward-compatible formats** — the old `"folder"` string key and plain string lists still work:
@@ -465,6 +468,21 @@ Edit `config.json`:
 ```json
 { "time": "17:30", "folder": "/path/to/folder", "count": 2 }
 { "time": "17:30", "folders": ["/path/a", "/path/b"], "count": 1 }
+```
+
+### How time-window scheduling works
+
+When `end_time` is set, the scheduler:
+
+1. Reads durations of upcoming episodes via `ffprobe`
+2. Selects the minimum number of full episodes whose total runtime covers the window (episodes always play to completion — no mid-episode cutoff)
+3. Because episodes rarely divide the window exactly, the last episode typically runs a few seconds past `end_time`. This overshoot is saved as `resume_offset` in `playback_state.json`
+4. At the next session the first episode is seeked forward by `resume_offset` seconds (VLC `:start-time` option), so the total content played each day stays aligned with the configured window
+
+Install `ffmpeg` to enable this feature:
+
+```bash
+sudo apt install ffmpeg
 ```
 
 Changes to `config.json` are picked up automatically within 30 seconds — no restart needed.
@@ -527,10 +545,22 @@ Show which video(s) would be played at a given time without changing state:
 
 ```bash
 python3 vlc_scheduler.py --peek 19:00
-# Schedule 19:00  →  folder: /home/user/videos/series_A
+# Schedule 19:00  →  folder: /home/user/videos/series_B
 #   003_episode.mp4
 #   004_episode.mp4
 #   005_episode.mp4
+```
+
+For a time-window schedule, durations and offset info are shown:
+
+```bash
+python3 vlc_scheduler.py --peek 13:00
+# Schedule 13:00–14:30  →  folder: /home/user/videos/series_A
+# Resume offset: 142.0s  |  Next session offset: 87.3s
+#   004_episode.mp4  (1382s)
+#   005_episode.mp4  (1401s)
+#   006_episode.mp4  (1394s)
+#   007_episode.mp4  (1365s)
 ```
 
 ### Simulate a playback
@@ -539,9 +569,22 @@ Advance the state as if the scheduler played once at a given time (no VLC launch
 
 ```bash
 python3 vlc_scheduler.py --advance 19:00
-# Simulated playback at 19:00  →  folder: /home/user/videos/series_A
+# Simulated playback at 19:00  →  folder: /home/user/videos/series_B
 #   003_episode.mp4
 #   ...
+# State updated.
+```
+
+For a time-window schedule, the resume offset is calculated and saved too:
+
+```bash
+python3 vlc_scheduler.py --advance 13:00
+# Simulated playback at 13:00–14:30  →  folder: /home/user/videos/series_A
+#   004_episode.mp4
+#   005_episode.mp4
+#   006_episode.mp4
+#   007_episode.mp4
+# Resume offset saved: 87.3s
 # State updated.
 ```
 
@@ -559,16 +602,26 @@ curl http://127.0.0.1:8765/
   "schedules": [
     {
       "time": "13:00",
-      "folders": [
-        {"path": "/home/user/videos/series_A", "count": 3},
-        {"path": "/home/user/videos/series_B", "count": 1}
-      ],
+      "end_time": "14:30",
+      "folders": [{"path": "/home/user/videos/series_A", "count": 1}],
       "active_folder": "/home/user/videos/series_A",
+      "last_played": "007_title.mp4",
+      "resume_offset": 87.3
+    },
+    {
+      "time": "19:00",
+      "folders": [
+        {"path": "/home/user/videos/series_B", "count": 3},
+        {"path": "/home/user/videos/series_C", "count": 1}
+      ],
+      "active_folder": "/home/user/videos/series_B",
       "last_played": "003_title.mp4"
     }
   ]
 }
 ```
+
+`resume_offset` (seconds) only appears for time-window schedules and shows how far into the first episode of the next session VLC will seek.
 
 ---
 
@@ -589,6 +642,9 @@ vlc-scheduler/
 
 **Missing `schedule` module:**
 Run `sudo apt install python3-schedule`.
+
+**`'ffprobe' not found` on startup:**
+`end_time` scheduling requires `ffprobe` (part of `ffmpeg`): `sudo apt install ffmpeg`.
 
 **Choppy video playback:**
 VLC uses OpenGL output (`--vout gl`) and hardware decoding (`--avcodec-hw any`) by default. Verify VA-API is working:
