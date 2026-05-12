@@ -6,6 +6,7 @@ Automatically plays the next numbered video(s) from designated folders at schedu
 
 - **Scheduled Playback**: Configure multiple folders with different playback times
 - **Time-window scheduling**: Set a `start_time` + `end_time` and the scheduler automatically calculates how many episodes are needed to fill the slot. The overshoot is tracked so the next session seeks into the first episode to stay perfectly aligned across days
+- **Mirror slots**: Mark a slot as `"mirror": "HH:MM"` to make it an exact replica of another slot — same episodes, same seek offset, no state advancement
 - **Sequential Playback**: Plays numbered videos in order (001.mp4, 002.mp4, …); when a folder is exhausted it advances to the next folder in the list, wrapping back to the first after the last
 - **Multi-video batches**: Play N videos back-to-back per schedule slot, with a per-folder count
 - **State Persistence**: Remembers the last played video, active folder, and session overshoot offset across restarts
@@ -441,6 +442,11 @@ Edit `config.json`:
       "before_play": "xdg-screensaver reset"
     },
     {
+      "time": "18:00",
+      "mirror": "13:00",
+      "before_play": "xdg-screensaver reset"
+    },
+    {
       "time": "19:00",
       "folders": [
         {"path": "/home/user/videos/series_B", "count": 3},
@@ -461,6 +467,7 @@ Edit `config.json`:
 | `schedules[].folders`            | Ordered list of folder objects. When a folder's videos are all played, the next folder is used  |
 | `schedules[].folders[].path`     | Full path to the folder containing numbered videos                                              |
 | `schedules[].folders[].count`    | Number of videos to play back-to-back (default: `1`). Ignored when `end_time` is set           |
+| `schedules[].mirror`             | Optional. Set to the `time` of another slot to make this an exact replica of it. When set, all other fields except `before_play` are inherited from the referenced slot. |
 | `schedules[].before_play`        | Optional shell command to run before launching VLC                                              |
 
 **Backward-compatible formats** — the old `"folder"` string key and plain string lists still work:
@@ -484,6 +491,14 @@ Install `ffmpeg` to enable this feature:
 ```bash
 sudo apt install ffmpeg
 ```
+
+### How mirror slots work
+
+A mirror slot plays the exact same episodes as its primary slot, with the same seek offset. It never advances state — only the primary does.
+
+**If the primary fires first:** the primary saves a `last_session` snapshot (folder, filenames, `resume_offset` used). When the mirror fires later, it reads that snapshot and replays identically.
+
+**If the mirror fires first:** no snapshot exists yet, so the mirror computes the same selection the primary would (same state, same window) and plays it without writing anything to state. The primary then fires normally and advances the queue.
 
 Changes to `config.json` are picked up automatically within 30 seconds — no restart needed.
 
