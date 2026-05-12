@@ -394,18 +394,31 @@ def get_next_videos_for_window(
         # because VLC will seek into it.
         total          = len(videos)
         selected       = []
+        durations      = []
         total_duration = 0.0
         for offset in range(total):
             idx   = (next_index + offset) % total
             video = videos[idx]
             dur   = get_video_duration(video)
             selected.append(video)
+            durations.append(dur)
             total_duration += dur
             # Effective content played = total_duration - resume_offset
             if total_duration - resume_offset >= window_seconds:
                 break
 
         new_resume_offset = max(0.0, total_duration - resume_offset - window_seconds)
+
+        episode_list = ", ".join(
+            f"{v.name} ({d:.0f}s)" for v, d in zip(selected, durations)
+        )
+        log.info(
+            f"Window {window_seconds/60:.0f}m: {len(selected)} episode(s) selected"
+            f" — {episode_list}"
+            f" — total {total_duration:.0f}s, offset_in={resume_offset:.1f}s"
+            f" → content {total_duration - resume_offset:.0f}s"
+            f", offset_out={new_resume_offset:.1f}s"
+        )
         return selected, folder_index, folder_path, resume_offset, new_resume_offset
 
     log.error("No playable videos found in any configured folder.")
@@ -452,8 +465,12 @@ def play_videos(folder_entries: list, vlc_path: str, extensions: list,
 
     if _dry_run:
         log.info(f"[DRY RUN] Would launch VLC → {names}")
-        if resume_offset > 0:
-            log.info(f"[DRY RUN] First video seeked to {resume_offset:.1f}s (carried from last session)")
+        if window_seconds is not None:
+            log.info(
+                f"[DRY RUN] offset_in={resume_offset:.1f}s"
+                f", offset_out={new_resume_offset:.1f}s"
+                + (" (first episode seeked)" if resume_offset > 0 else "")
+            )
         return
 
     log.info(f"Launching VLC → {names}")
