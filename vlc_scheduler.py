@@ -59,8 +59,9 @@ DEFAULT_CONFIG = {
     "schedules": [
         {
             "time": "17:30",
+            "end_time": "19:00",
             "folders": [
-                {"path": str(BASE_DIR / "folder01"), "count": 1},
+                {"path": str(BASE_DIR / "folder01")},
             ],
         },
         {
@@ -162,7 +163,20 @@ def validate_config(config: dict) -> bool:
     ext_set    = {e.lower() for e in extensions}
     errors     = []
 
+    if any(e.get("end_time") for e in config.get("schedules", [])):
+        if not shutil.which("ffprobe"):
+            errors.append("  'ffprobe' not found — required for end_time scheduling. Install ffmpeg.")
+
     for entry in config.get("schedules", []):
+        end_time = entry.get("end_time")
+        if end_time:
+            try:
+                ws = _time_to_seconds(end_time) - _time_to_seconds(entry["time"])
+                if ws <= 0:
+                    errors.append(f"  Schedule {entry['time']}: end_time '{end_time}' must be after start time")
+            except (ValueError, KeyError):
+                errors.append(f"  Schedule {entry.get('time', '?')}: invalid end_time '{end_time}'")
+
         for fe in get_folder_entries(entry):
             folder = Path(fe["path"])
             if not folder.exists():
@@ -206,6 +220,29 @@ def _natural_sort_key(path: Path):
     """Natural-sort: '2.webm' < '10.webm', 'ep02.mkv' < 'ep10.mkv'."""
     parts = re.split(r"(\d+)", path.stem)
     return [int(c) if c.isdigit() else c.lower() for c in parts]
+
+
+def _time_to_seconds(t: str) -> int:
+    """Convert 'HH:MM' to seconds since midnight."""
+    h, m = t.split(":")
+    return int(h) * 3600 + int(m) * 60
+
+
+def get_video_duration(path: Path) -> float:
+    """Return video duration in seconds via ffprobe, or 0.0 on failure."""
+    try:
+        out = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            capture_output=True, text=True, timeout=15,
+        ).stdout.strip()
+        return float(out) if out else 0.0
+    except Exception:
+        return 0.0
 
 
 def get_next_videos(folder_entries: list, state: dict, extensions: list):
@@ -283,6 +320,98 @@ def get_next_videos(folder_entries: list, state: dict, extensions: list):
     return [], 0, folder_entries[0]["path"]
 
 
+def get_next_videos_for_window(
+    folder_entries: list, state: dict, extensions: list, window_seconds: float,
+) -> tuple:
+    """
+    Select enough videos from the current folder to fill window_seconds of
+    content, honouring resume_offset from a previous session.
+
+    resume_offset is the number of seconds that were played beyond end_time in
+    the last session.  The first video of this session is seeked forward by
+    that amount, so the scheduler stays aligned with the configured time window
+    across sessions.
+
+    Returns (videos, folder_index, folder_path, resume_offset_used, new_resume_offset).
+    new_resume_offset is the overshoot to carry into the next session (>=0).
+    """
+    state_key   = folder_entries[0]["path"]
+    entry_state = state.get(state_key, {})
+    if isinstance(entry_state, str):
+        entry_state = {"folder_index": 0, "last_played": entry_state}
+
+    folder_index  = entry_state.get("folder_index", 0) % len(folder_entries)
+    last_played   = entry_state.get("last_played")
+    resume_offset = float(entry_state.get("resume_offset", 0.0))
+
+    ext_set = {e.lower() for e in extensions}
+
+    for _ in range(len(folder_entries)):
+        fe          = folder_entries[folder_index]
+        folder_path = fe["path"]
+        folder      = Path(folder_path)
+
+        if not folder.exists():
+            log.error(f"Folder not found: {folder_path} — skipping to next")
+            folder_index  = (folder_index + 1) % len(folder_entries)
+            last_played   = None
+            resume_offset = 0.0
+            continue
+
+        videos = sorted(
+            [f for f in folder.iterdir() if f.is_file() and f.suffix.lower() in ext_set],
+            key=_natural_sort_key,
+        )
+
+        if not videos:
+            log.error(f"No video files in: {folder_path} — skipping to next")
+            folder_index  = (folder_index + 1) % len(folder_entries)
+            last_played   = None
+            resume_offset = 0.0
+            continue
+
+        next_index = 0
+        if last_played:
+            for i, f in enumerate(videos):
+                if f.name == last_played:
+                    next_index = i + 1
+                    break
+
+        if next_index >= len(videos):
+            next_folder_index = (folder_index + 1) % len(folder_entries)
+            log.info(
+                f"All videos played in {folder_path}"
+                + (f" — advancing to {folder_entries[next_folder_index]['path']}"
+                   if len(folder_entries) > 1 else " — wrapping back to first")
+            )
+            folder_index  = next_folder_index
+            last_played   = None
+            resume_offset = 0.0
+            continue
+
+        # Pick enough videos (wrapping within the folder) to fill window_seconds.
+        # The first video only contributes (duration - resume_offset) of content
+        # because VLC will seek into it.
+        total          = len(videos)
+        selected       = []
+        total_duration = 0.0
+        for offset in range(total):
+            idx   = (next_index + offset) % total
+            video = videos[idx]
+            dur   = get_video_duration(video)
+            selected.append(video)
+            total_duration += dur
+            # Effective content played = total_duration - resume_offset
+            if total_duration - resume_offset >= window_seconds:
+                break
+
+        new_resume_offset = max(0.0, total_duration - resume_offset - window_seconds)
+        return selected, folder_index, folder_path, resume_offset, new_resume_offset
+
+    log.error("No playable videos found in any configured folder.")
+    return [], 0, folder_entries[0]["path"], 0.0, 0.0
+
+
 # ── Hooks ─────────────────────────────────────────────────────────────────────
 
 def _run_hook(cmd: str) -> None:
@@ -302,11 +431,20 @@ def _run_hook(cmd: str) -> None:
 # ── Playback ──────────────────────────────────────────────────────────────────
 
 def play_videos(folder_entries: list, vlc_path: str, extensions: list,
-                before_play: Optional[str] = None) -> None:
+                before_play: Optional[str] = None,
+                window_seconds: Optional[float] = None) -> None:
     global _active_proc
 
-    state                             = load_state()
-    videos, folder_index, folder_path = get_next_videos(folder_entries, state, extensions)
+    state = load_state()
+
+    if window_seconds is not None:
+        videos, folder_index, folder_path, resume_offset, new_resume_offset = \
+            get_next_videos_for_window(folder_entries, state, extensions, window_seconds)
+    else:
+        videos, folder_index, folder_path = get_next_videos(folder_entries, state, extensions)
+        resume_offset     = 0.0
+        new_resume_offset = 0.0
+
     if not videos:
         return
 
@@ -314,9 +452,13 @@ def play_videos(folder_entries: list, vlc_path: str, extensions: list,
 
     if _dry_run:
         log.info(f"[DRY RUN] Would launch VLC → {names}")
+        if resume_offset > 0:
+            log.info(f"[DRY RUN] First video seeked to {resume_offset:.1f}s (carried from last session)")
         return
 
     log.info(f"Launching VLC → {names}")
+    if resume_offset > 0:
+        log.info(f"First episode seeked to {resume_offset:.1f}s (overshoot from last session)")
 
     # Kill any running VLC — use pkill so it works across process boundaries
     # (e.g. --play-now spawns a fresh process where _active_proc is always None)
@@ -330,6 +472,14 @@ def play_videos(folder_entries: list, vlc_path: str, extensions: list,
         log.info(f"Running before_play hook: {before_play!r}")
         _run_hook(before_play)
 
+    # Build the per-item VLC argument list.
+    # `:start-time=X` is a per-item VLC option that applies only to the preceding file.
+    vlc_items: list[str] = []
+    for i, v in enumerate(videos):
+        vlc_items.append(str(v))
+        if i == 0 and resume_offset > 0:
+            vlc_items.append(f":start-time={resume_offset:.3f}")
+
     try:
         env = os.environ.copy()
         env.setdefault("DISPLAY", ":0")
@@ -341,13 +491,20 @@ def play_videos(folder_entries: list, vlc_path: str, extensions: list,
                 "--no-video-title-show",
                 "--vout", "gl",
                 "--avcodec-hw", "vaapi",
-                *(str(v) for v in videos),
+                *vlc_items,
             ],
             env=env,
             stderr=subprocess.DEVNULL,
         )
-        # Persist state: record which folder and the last video played
-        state[folder_entries[0]["path"]] = {"folder_index": folder_index, "last_played": videos[-1].name}
+        state_key = folder_entries[0]["path"]
+        new_state = {"folder_index": folder_index, "last_played": videos[-1].name}
+        if window_seconds is not None:
+            new_state["resume_offset"] = round(new_resume_offset, 3)
+            log.info(
+                f"Next session resume_offset: {new_resume_offset:.1f}s"
+                + (" (first episode will be seeked)" if new_resume_offset > 0 else " (starts from beginning)")
+            )
+        state[state_key] = new_state
         save_state(state)
     except FileNotFoundError:
         log.error(f"VLC executable not found at: {vlc_path}  — update config.json")
@@ -367,12 +524,16 @@ class _StatusHandler(http.server.BaseHTTPRequestHandler):
             if isinstance(entry_state, str):
                 entry_state = {"folder_index": 0, "last_played": entry_state}
             folder_index = entry_state.get("folder_index", 0) % len(fes)
-            return {
+            result = {
                 "time":          entry["time"],
                 "folders":       fes,
                 "active_folder": fes[folder_index]["path"],
                 "last_played":   entry_state.get("last_played"),
             }
+            if entry.get("end_time"):
+                result["end_time"]      = entry["end_time"]
+                result["resume_offset"] = entry_state.get("resume_offset", 0.0)
+            return result
 
         payload = {
             "vlc_running": _active_proc is not None and _active_proc.poll() is None,
@@ -422,12 +583,23 @@ def _register_schedules(config: dict) -> None:
 
     for entry in config["schedules"]:
         t           = entry["time"]
+        end_time    = entry.get("end_time")
         fes         = get_folder_entries(entry)
         before_play = entry.get("before_play")
+
+        window_seconds: Optional[float] = None
+        if end_time:
+            ws = _time_to_seconds(end_time) - _time_to_seconds(t)
+            if ws > 0:
+                window_seconds = float(ws)
+
         for fe in fes:
-            log.info(f"  Registered  {t}  →  {fe['path']}  (count={fe['count']})")
+            if window_seconds is not None:
+                log.info(f"  Registered  {t}–{end_time}  →  {fe['path']}  (window={int(window_seconds//60)}m, count=auto)")
+            else:
+                log.info(f"  Registered  {t}  →  {fe['path']}  (count={fe['count']})")
         schedule.every().day.at(t).do(
-            play_videos, fes, vlc_path, extensions, before_play
+            play_videos, fes, vlc_path, extensions, before_play, window_seconds
         )
 
 
@@ -484,8 +656,13 @@ def main() -> None:
              if args.play_now in [fe["path"] for fe in get_folder_entries(e)]),
             None,
         )
-        fes = get_folder_entries(entry) if entry else [{"path": args.play_now, "count": 1}]
-        play_videos(fes, vlc_path, extensions, (entry or {}).get("before_play"))
+        fes          = get_folder_entries(entry) if entry else [{"path": args.play_now, "count": 1}]
+        window_secs  = None
+        if entry and entry.get("end_time"):
+            ws = _time_to_seconds(entry["end_time"]) - _time_to_seconds(entry["time"])
+            if ws > 0:
+                window_secs = float(ws)
+        play_videos(fes, vlc_path, extensions, (entry or {}).get("before_play"), window_secs)
         return
 
     # --peek: show next video(s) for a scheduled time without changing state
@@ -494,12 +671,21 @@ def main() -> None:
         if not entry:
             print(f"No schedule found for time: {args.peek}")
             sys.exit(1)
-        fes    = get_folder_entries(entry)
-        state  = load_state()
-        videos, folder_index, folder_path = get_next_videos(fes, state, extensions)
-        print(f"Schedule {args.peek}  →  folder: {folder_path}")
+        fes      = get_folder_entries(entry)
+        state    = load_state()
+        end_time = entry.get("end_time")
+        if end_time:
+            ws = _time_to_seconds(end_time) - _time_to_seconds(entry["time"])
+            videos, _, folder_path, resume_offset, new_resume_offset = \
+                get_next_videos_for_window(fes, state, extensions, float(ws))
+            print(f"Schedule {args.peek}–{end_time}  →  folder: {folder_path}")
+            print(f"Resume offset: {resume_offset:.1f}s  |  Next session offset: {new_resume_offset:.1f}s")
+        else:
+            videos, _, folder_path = get_next_videos(fes, state, extensions)
+            print(f"Schedule {args.peek}  →  folder: {folder_path}")
         for v in videos:
-            print(f"  {v.name}")
+            dur = f"  ({get_video_duration(v):.0f}s)" if end_time else ""
+            print(f"  {v.name}{dur}")
         return
 
     # --advance: advance state as if one playback ran at a scheduled time
@@ -508,17 +694,36 @@ def main() -> None:
         if not entry:
             print(f"No schedule found for time: {args.advance}")
             sys.exit(1)
-        fes    = get_folder_entries(entry)
-        state  = load_state()
-        videos, folder_index, folder_path = get_next_videos(fes, state, extensions)
-        if not videos:
-            print("No videos to advance.")
-            sys.exit(1)
-        state[fes[0]["path"]] = {"folder_index": folder_index, "last_played": videos[-1].name}
-        save_state(state)
-        print(f"Simulated playback at {args.advance}  →  folder: {folder_path}")
-        for v in videos:
-            print(f"  {v.name}")
+        fes      = get_folder_entries(entry)
+        state    = load_state()
+        end_time = entry.get("end_time")
+        if end_time:
+            ws = _time_to_seconds(end_time) - _time_to_seconds(entry["time"])
+            videos, folder_index, folder_path, resume_offset, new_resume_offset = \
+                get_next_videos_for_window(fes, state, extensions, float(ws))
+            if not videos:
+                print("No videos to advance.")
+                sys.exit(1)
+            state[fes[0]["path"]] = {
+                "folder_index": folder_index,
+                "last_played":  videos[-1].name,
+                "resume_offset": round(new_resume_offset, 3),
+            }
+            save_state(state)
+            print(f"Simulated playback at {args.advance}–{end_time}  →  folder: {folder_path}")
+            for v in videos:
+                print(f"  {v.name}")
+            print(f"Resume offset saved: {new_resume_offset:.1f}s")
+        else:
+            videos, folder_index, folder_path = get_next_videos(fes, state, extensions)
+            if not videos:
+                print("No videos to advance.")
+                sys.exit(1)
+            state[fes[0]["path"]] = {"folder_index": folder_index, "last_played": videos[-1].name}
+            save_state(state)
+            print(f"Simulated playback at {args.advance}  →  folder: {folder_path}")
+            for v in videos:
+                print(f"  {v.name}")
         print("State updated.")
         return
 
