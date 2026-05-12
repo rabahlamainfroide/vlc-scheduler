@@ -167,7 +167,14 @@ def validate_config(config: dict) -> bool:
         if not shutil.which("ffprobe"):
             errors.append("  'ffprobe' not found — required for end_time scheduling. Install ffmpeg.")
 
+    schedule_times = {e["time"] for e in config.get("schedules", [])}
     for entry in config.get("schedules", []):
+        if "mirror" in entry:
+            ref = entry["mirror"]
+            if ref not in schedule_times:
+                errors.append(f"  Schedule {entry['time']}: mirror target '{ref}' not found")
+            continue
+
         end_time = entry.get("end_time")
         if end_time:
             try:
@@ -445,18 +452,44 @@ def _run_hook(cmd: str) -> None:
 
 def play_videos(folder_entries: list, vlc_path: str, extensions: list,
                 before_play: Optional[str] = None,
-                window_seconds: Optional[float] = None) -> None:
+                window_seconds: Optional[float] = None,
+                is_mirror: bool = False) -> None:
     global _active_proc
 
-    state = load_state()
+    state     = load_state()
+    state_key = folder_entries[0]["path"]
 
-    if window_seconds is not None:
-        videos, folder_index, folder_path, resume_offset, new_resume_offset = \
-            get_next_videos_for_window(folder_entries, state, extensions, window_seconds)
+    if is_mirror:
+        # Mirror slot: replay the exact episodes the primary played in its last session.
+        # If the primary hasn't fired yet today, compute the same selection it would
+        # (same state, same window) and play without touching state.
+        entry_state = state.get(state_key, {})
+        if isinstance(entry_state, str):
+            entry_state = {}
+
+        last_folder = entry_state.get("last_session_folder")
+        last_names  = entry_state.get("last_session_videos", [])
+        resume_offset = float(entry_state.get("last_session_resume_offset", 0.0))
+
+        if last_names and last_folder:
+            log.info(f"[MIRROR] Replaying last session — {len(last_names)} episode(s) from {last_folder}")
+            videos = [Path(last_folder) / name for name in last_names]
+        else:
+            log.info("[MIRROR] No last session recorded yet — computing same selection as primary")
+            if window_seconds is not None:
+                videos, _, _, resume_offset, _ = \
+                    get_next_videos_for_window(folder_entries, state, extensions, window_seconds)
+            else:
+                videos, _, _ = get_next_videos(folder_entries, state, extensions)
+                resume_offset = 0.0
     else:
-        videos, folder_index, folder_path = get_next_videos(folder_entries, state, extensions)
-        resume_offset     = 0.0
-        new_resume_offset = 0.0
+        if window_seconds is not None:
+            videos, folder_index, folder_path, resume_offset, new_resume_offset = \
+                get_next_videos_for_window(folder_entries, state, extensions, window_seconds)
+        else:
+            videos, folder_index, folder_path = get_next_videos(folder_entries, state, extensions)
+            resume_offset     = 0.0
+            new_resume_offset = 0.0
 
     if not videos:
         return
@@ -464,18 +497,22 @@ def play_videos(folder_entries: list, vlc_path: str, extensions: list,
     names = ", ".join(v.name for v in videos)
 
     if _dry_run:
-        log.info(f"[DRY RUN] Would launch VLC → {names}")
-        if window_seconds is not None:
+        prefix = "[DRY RUN][MIRROR] " if is_mirror else "[DRY RUN] "
+        log.info(f"{prefix}Would launch VLC → {names}")
+        if window_seconds is not None and not is_mirror:
             log.info(
                 f"[DRY RUN] offset_in={resume_offset:.1f}s"
                 f", offset_out={new_resume_offset:.1f}s"
                 + (" (first episode seeked)" if resume_offset > 0 else "")
             )
+        elif resume_offset > 0:
+            log.info(f"[DRY RUN] First episode seeked to {resume_offset:.1f}s")
         return
 
-    log.info(f"Launching VLC → {names}")
+    prefix = "[MIRROR] " if is_mirror else ""
+    log.info(f"{prefix}Launching VLC → {names}")
     if resume_offset > 0:
-        log.info(f"First episode seeked to {resume_offset:.1f}s (overshoot from last session)")
+        log.info(f"First episode seeked to {resume_offset:.1f}s")
 
     # Kill any running VLC — use pkill so it works across process boundaries
     # (e.g. --play-now spawns a fresh process where _active_proc is always None)
@@ -513,16 +550,26 @@ def play_videos(folder_entries: list, vlc_path: str, extensions: list,
             env=env,
             stderr=subprocess.DEVNULL,
         )
-        state_key = folder_entries[0]["path"]
-        new_state = {"folder_index": folder_index, "last_played": videos[-1].name}
-        if window_seconds is not None:
-            new_state["resume_offset"] = round(new_resume_offset, 3)
-            log.info(
-                f"Next session resume_offset: {new_resume_offset:.1f}s"
-                + (" (first episode will be seeked)" if new_resume_offset > 0 else " (starts from beginning)")
-            )
-        state[state_key] = new_state
-        save_state(state)
+
+        if is_mirror:
+            log.info("[MIRROR] State unchanged — primary slot manages progression")
+        else:
+            new_state = {
+                "folder_index":               folder_index,
+                "last_played":                videos[-1].name,
+                "last_session_folder":        folder_path,
+                "last_session_videos":        [v.name for v in videos],
+                "last_session_resume_offset": round(resume_offset, 3),
+            }
+            if window_seconds is not None:
+                new_state["resume_offset"] = round(new_resume_offset, 3)
+                log.info(
+                    f"Next session resume_offset: {new_resume_offset:.1f}s"
+                    + (" (first episode will be seeked)" if new_resume_offset > 0 else " (starts from beginning)")
+                )
+            state[state_key] = new_state
+            save_state(state)
+
     except FileNotFoundError:
         log.error(f"VLC executable not found at: {vlc_path}  — update config.json")
     except Exception:
@@ -600,11 +647,34 @@ def _register_schedules(config: dict) -> None:
 
     for entry in config["schedules"]:
         t           = entry["time"]
-        end_time    = entry.get("end_time")
-        fes         = get_folder_entries(entry)
         before_play = entry.get("before_play")
 
-        window_seconds: Optional[float] = None
+        # Mirror slot: delegate folder/window config to the referenced primary slot
+        if "mirror" in entry:
+            ref_time  = entry["mirror"]
+            ref_entry = next((e for e in config["schedules"] if e["time"] == ref_time), None)
+            if ref_entry is None:
+                log.error(f"  Schedule {t}: mirror target '{ref_time}' not found — skipping")
+                continue
+            fes         = get_folder_entries(ref_entry)
+            ref_end     = ref_entry.get("end_time")
+            window_seconds: Optional[float] = None
+            if ref_end:
+                ws = _time_to_seconds(ref_end) - _time_to_seconds(ref_entry["time"])
+                if ws > 0:
+                    window_seconds = float(ws)
+            if before_play is None:
+                before_play = ref_entry.get("before_play")
+            log.info(f"  Registered  {t}  →  mirror of {ref_time}  ({fes[0]['path']})")
+            schedule.every().day.at(t).do(
+                play_videos, fes, vlc_path, extensions, before_play, window_seconds, True
+            )
+            continue
+
+        end_time    = entry.get("end_time")
+        fes         = get_folder_entries(entry)
+
+        window_seconds = None
         if end_time:
             ws = _time_to_seconds(end_time) - _time_to_seconds(t)
             if ws > 0:
