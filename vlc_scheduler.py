@@ -432,6 +432,60 @@ def get_next_videos_for_window(
     return [], 0, folder_entries[0]["path"], 0.0, 0.0
 
 
+# ── VLC process teardown ──────────────────────────────────────────────────────
+
+def kill_vlc() -> None:
+    """Terminate all VLC processes and block until they are gone."""
+    global _active_proc
+
+    # Terminate the handle we have (if any)
+    if _active_proc is not None:
+        try:
+            if _active_proc.poll() is None:
+                _active_proc.terminate()
+                log.info(f"Sent SIGTERM to tracked VLC process (pid={_active_proc.pid})")
+        except Exception:
+            log.exception("Error terminating tracked VLC process")
+        _active_proc = None
+
+    # Kill any other VLC processes by name (survives restarts / multiple instances)
+    try:
+        result = subprocess.run(["pkill", "vlc"], capture_output=True)
+        if result.returncode == 0:
+            log.info("pkill vlc: signalled running VLC processes")
+        elif result.returncode != 1:
+            log.warning(f"pkill vlc returned unexpected code {result.returncode}")
+    except FileNotFoundError:
+        log.warning("pkill not found — falling back to killall")
+        try:
+            subprocess.run(["killall", "vlc"], capture_output=True)
+        except Exception:
+            log.exception("killall vlc also failed")
+    except Exception:
+        log.exception("pkill vlc raised an unexpected error")
+
+    # Wait up to 5 s for VLC to actually exit
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        if subprocess.run(["pgrep", "vlc"], capture_output=True).returncode != 0:
+            log.info("VLC has terminated.")
+            return
+        time.sleep(0.3)
+
+    # Still alive — escalate to SIGKILL
+    log.warning("VLC did not exit after 5 s — sending SIGKILL")
+    try:
+        subprocess.run(["pkill", "-9", "vlc"], capture_output=True)
+    except Exception:
+        log.exception("pkill -9 vlc failed")
+
+    time.sleep(1.0)
+    if subprocess.run(["pgrep", "vlc"], capture_output=True).returncode == 0:
+        log.error("VLC still running after SIGKILL — proceeding anyway")
+    else:
+        log.info("VLC forcefully terminated.")
+
+
 # ── Hooks ─────────────────────────────────────────────────────────────────────
 
 def _run_hook(cmd: str) -> None:
@@ -514,12 +568,7 @@ def play_videos(folder_entries: list, vlc_path: str, extensions: list,
     if resume_offset > 0:
         log.info(f"First episode seeked to {resume_offset:.1f}s")
 
-    # Kill any running VLC — use pkill so it works across process boundaries
-    # (e.g. --play-now spawns a fresh process where _active_proc is always None)
-    result = subprocess.run(["pkill", "vlc"], capture_output=True)
-    if result.returncode == 0:
-        log.info("Killed existing VLC instance.")
-        time.sleep(1)
+    kill_vlc()
 
     # Pre-play hook (e.g. disable screensaver)
     if before_play:
@@ -820,7 +869,7 @@ def main() -> None:
         if not file_path.is_file():
             print(f"File not found: {args.play_file}")
             sys.exit(1)
-        subprocess.run(["pkill", "vlc"], capture_output=True)
+        kill_vlc()
         env = os.environ.copy()
         env.setdefault("DISPLAY", ":0")
         subprocess.Popen(
