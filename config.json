@@ -19,15 +19,105 @@
   ],
   "schedules": [
     {
-      "time": "13:00",
-      "folders": [{ "path": "/home/chak/videos/hs", "count": 1 }],
+      "time": "06:00",
+      "end_time": "08:00",
+      "mirror": "13:00",
       "before_play": "xdg-screensaver reset ; amixer set Master 80%"
     },
     {
-      "time": "19:00",
+      "time": "08:00",
+      "end_time": "09:00",
+      "mirror": "15:00",
+      "before_play": "xdg-screensaver reset ; amixer set Master 80%"
+    },
+    {
+      "time": "09:00",
+      "end_time": "11:00",
+      "mirror": "18:00",
+      "before_play": "xdg-screensaver reset ; amixer set Master 80%"
+    },
+    {
+      "time": "11:00",
+      "end_time": "13:00",
+      "mirror": "21:00",
+      "before_play": "xdg-screensaver reset ; amixer set Master 80%"
+    },
+    {
+      "time": "13:00",
+      "end_time": "15:00",
       "folders": [
-        { "path": "/home/chak/videos/ms", "count": 2 },
-        { "path": "/home/chak/videos/wc", "count": 1 }
+        {
+          "path": "/home/chak/videos/am"
+        },
+        {
+          "path": "/home/chak/videos/wd"
+        }
+      ],
+      "before_play": "xdg-screensaver reset ; amixer set Master 80%"
+    },
+    {
+      "time": "15:00",
+      "end_time": "16:00",
+      "folders": [
+        {
+          "path": "/home/chak/videos/fa"
+        }
+      ],
+      "before_play": "xdg-screensaver reset ; amixer set Master 80%"
+    },
+    {
+      "time": "16:00",
+      "end_time": "17:00",
+      "folders": [
+        {
+          "path": "/home/chak/videos/aa"
+        }
+      ],
+      "before_play": "xdg-screensaver reset ; amixer set Master 80%"
+    },
+    {
+      "time": "17:00",
+      "end_time": "18:00",
+      "folders": [
+        {
+          "path": "/home/chak/videos/ik"
+        }
+      ],
+      "before_play": "xdg-screensaver reset ; amixer set Master 80%"
+    },
+    {
+      "time": "18:00",
+      "end_time": "20:00",
+      "folders": [
+        {
+          "path": "/home/chak/videos/mh"
+        },
+        {
+          "path": "/home/chak/videos/wc"
+        }
+      ],
+      "before_play": "xdg-screensaver reset ; amixer set Master 80%"
+    },
+    {
+      "time": "20:00",
+      "end_time": "21:00",
+      "folders": [
+        {
+          "path": "/home/chak/videos/aa"
+        }
+      ],
+      "before_play": "xdg-screensaver reset ; amixer set Master 80%"
+    },
+    {
+      "time": "21:00",
+      "end_time": "23:00",
+      "folders": [
+        {
+          "path": "/home/chak/videos/hs"
+        },
+        {
+          "path": "/home/chak/videos/sk"
+        }
       ],
       "before_play": "xdg-screensaver reset ; amixer set Master 80%"
     }
