@@ -6,6 +6,7 @@ State (last played index per folder) is persisted in playback_state.json.
 """
 
 import argparse
+import datetime
 import http.server
 import json
 import logging
@@ -514,22 +515,31 @@ def play_videos(folder_entries: list, vlc_path: str, extensions: list,
     state_key = folder_entries[0]["path"]
 
     if is_mirror:
-        # Mirror slot: replay the exact episodes the primary played in its last session.
-        # If the primary hasn't fired yet today, compute the same selection it would
-        # (same state, same window) and play without touching state.
+        # Mirror slot: replay the previous calendar day's primary session.
+        # If the primary has already fired today, its session is in last_session_* but
+        # we want yesterday's — stored in prev_session_*.  If the primary hasn't fired
+        # today yet, last_session_* already holds yesterday's data and is correct.
         entry_state = state.get(state_key, {})
         if isinstance(entry_state, str):
             entry_state = {}
 
-        last_folder = entry_state.get("last_session_folder")
-        last_names  = entry_state.get("last_session_videos", [])
-        resume_offset = float(entry_state.get("last_session_resume_offset", 0.0))
+        today_str = datetime.date.today().isoformat()
+        primary_fired_today = entry_state.get("last_session_date") == today_str
+
+        if primary_fired_today:
+            last_folder   = entry_state.get("prev_session_folder")
+            last_names    = entry_state.get("prev_session_videos", [])
+            resume_offset = float(entry_state.get("prev_session_resume_offset", 0.0))
+        else:
+            last_folder   = entry_state.get("last_session_folder")
+            last_names    = entry_state.get("last_session_videos", [])
+            resume_offset = float(entry_state.get("last_session_resume_offset", 0.0))
 
         if last_names and last_folder:
-            log.info(f"[MIRROR] Replaying last session — {len(last_names)} episode(s) from {last_folder}")
+            log.info(f"[MIRROR] Replaying previous day session — {len(last_names)} episode(s) from {last_folder}")
             videos = [Path(last_folder) / name for name in last_names]
         else:
-            log.info("[MIRROR] No last session recorded yet — computing same selection as primary")
+            log.info("[MIRROR] No previous day session recorded yet — computing same selection as primary")
             if window_seconds is not None:
                 videos, _, _, resume_offset, _ = \
                     get_next_videos_for_window(folder_entries, state, extensions, window_seconds)
@@ -603,9 +613,32 @@ def play_videos(folder_entries: list, vlc_path: str, extensions: list,
         if is_mirror:
             log.info("[MIRROR] State unchanged — primary slot manages progression")
         else:
+            today_str   = datetime.date.today().isoformat()
+            old_state   = state.get(state_key, {})
+            if isinstance(old_state, str):
+                old_state = {}
+
+            # Archive the previous session so mirrors can always replay yesterday's run.
+            # Only rotate when the date changes to avoid overwriting prev with today's.
+            old_date = old_state.get("last_session_date")
+            if old_date and old_date != today_str and old_state.get("last_session_videos"):
+                prev = {
+                    "prev_session_folder":        old_state["last_session_folder"],
+                    "prev_session_videos":        old_state["last_session_videos"],
+                    "prev_session_resume_offset": old_state.get("last_session_resume_offset", 0.0),
+                }
+            else:
+                prev = {
+                    k: old_state[k] for k in (
+                        "prev_session_folder", "prev_session_videos", "prev_session_resume_offset"
+                    ) if k in old_state
+                }
+
             new_state = {
+                **prev,
                 "folder_index":               folder_index,
                 "last_played":                videos[-1].name,
+                "last_session_date":          today_str,
                 "last_session_folder":        folder_path,
                 "last_session_videos":        [v.name for v in videos],
                 "last_session_resume_offset": round(resume_offset, 3),
