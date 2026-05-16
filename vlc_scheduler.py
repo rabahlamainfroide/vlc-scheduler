@@ -634,21 +634,40 @@ def play_videos(folder_entries: list, vlc_path: str, extensions: list,
                     ) if k in old_state
                 }
 
+            if window_seconds is not None and new_resume_offset > 0:
+                # Last selected episode was interrupted when the slot window ended (VLC
+                # is killed by the next slot).  Save state so the SAME episode is
+                # replayed next session from the point where it was cut off, not skipped.
+                last_ep_dur      = get_video_duration(videos[-1])
+                seek_into_last   = max(0.0, last_ep_dur - new_resume_offset)
+                # Point last_played at the episode BEFORE the interrupted one so that
+                # get_next_videos_for_window picks the interrupted episode as next_index.
+                if len(videos) > 1:
+                    last_played_save = videos[-2].name
+                else:
+                    last_played_save = old_state.get("last_played")
+                resume_offset_save = round(seek_into_last, 3)
+                log.info(
+                    f"Last episode interrupted — next session resumes {videos[-1].name}"
+                    f" at {seek_into_last:.1f}s"
+                )
+            else:
+                last_played_save   = videos[-1].name
+                resume_offset_save = 0.0
+                if window_seconds is not None:
+                    log.info("Next session starts from beginning (no overshoot)")
+
             new_state = {
                 **prev,
                 "folder_index":               folder_index,
-                "last_played":                videos[-1].name,
+                "last_played":                last_played_save,
                 "last_session_date":          today_str,
                 "last_session_folder":        folder_path,
                 "last_session_videos":        [v.name for v in videos],
                 "last_session_resume_offset": round(resume_offset, 3),
             }
             if window_seconds is not None:
-                new_state["resume_offset"] = round(new_resume_offset, 3)
-                log.info(
-                    f"Next session resume_offset: {new_resume_offset:.1f}s"
-                    + (" (first episode will be seeked)" if new_resume_offset > 0 else " (starts from beginning)")
-                )
+                new_state["resume_offset"] = resume_offset_save
             state[state_key] = new_state
             save_state(state)
 
