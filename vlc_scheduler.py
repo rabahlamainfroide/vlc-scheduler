@@ -640,12 +640,24 @@ def play_videos(folder_entries: list, vlc_path: str, extensions: list,
                 # replayed next session from the point where it was cut off, not skipped.
                 last_ep_dur      = get_video_duration(videos[-1])
                 seek_into_last   = max(0.0, last_ep_dur - new_resume_offset)
-                # Point last_played at the episode BEFORE the interrupted one so that
-                # get_next_videos_for_window picks the interrupted episode as next_index.
-                if len(videos) > 1:
-                    last_played_save = videos[-2].name
-                else:
-                    last_played_save = old_state.get("last_played")
+                # Find the true predecessor of the interrupted episode in the sorted
+                # folder list.  videos[-2] is wrong when the selection loop wrapped
+                # around to index 0: it would be the last file in the folder, which
+                # triggers a false exhaustion on the next session and skips the episode.
+                # Setting last_played=None when the interrupted episode is first (idx 0)
+                # causes next_index=0, so the episode is re-selected with the saved offset.
+                ext_set_scan  = {e.lower() for e in extensions}
+                all_sorted    = sorted(
+                    [f for f in Path(folder_path).iterdir()
+                     if f.is_file() and f.suffix.lower() in ext_set_scan],
+                    key=_natural_sort_key,
+                )
+                interrupted_idx  = next(
+                    (i for i, f in enumerate(all_sorted) if f.name == videos[-1].name), -1
+                )
+                last_played_save = (
+                    all_sorted[interrupted_idx - 1].name if interrupted_idx > 0 else None
+                )
                 resume_offset_save = round(seek_into_last, 3)
                 log.info(
                     f"Last episode interrupted — next session resumes {videos[-1].name}"
