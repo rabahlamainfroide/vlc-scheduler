@@ -14,6 +14,7 @@ Automatically plays the next numbered video(s) from designated folders at schedu
 - **Auto VLC Detection**: Finds VLC automatically — no path configuration needed
 - **Stale VLC Cleanup**: Kills any leftover VLC instance before starting a new one
 - **Pre-play Hooks**: Run a shell command before each playback (e.g. reset screensaver, set volume)
+- **Startup Catch-up**: If the machine reboots mid-playback or while a scheduled slot was missed, the scheduler immediately plays that slot on startup instead of waiting for the next one
 - **Config Hot-reload**: Edit `config.json` while running — changes take effect within 30 s
 - **Status Endpoint**: Live JSON status at `http://127.0.0.1:8765/`
 - **Dry-run Mode**: Preview what would play without launching VLC
@@ -527,6 +528,8 @@ Any numeric prefix works: `001`, `01`, `1`, `ep01`, etc.
 cd ~/vlc-scheduler
 python3 vlc_scheduler.py
 ```
+
+On startup the scheduler checks whether the most recently passed schedule slot was missed or interrupted (e.g. due to a power cut). If it was, that slot plays immediately rather than waiting for the next scheduled time. Normal restarts where all slots completed cleanly do nothing extra.
 
 ### Dry run
 

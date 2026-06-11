@@ -674,6 +674,8 @@ def play_videos(folder_entries: list, vlc_path: str, extensions: list,
                 "folder_index":               folder_index,
                 "last_played":                last_played_save,
                 "last_session_date":          today_str,
+                "last_session_at":            datetime.datetime.now().isoformat(),
+                "session_completed":          False,
                 "last_session_folder":        folder_path,
                 "last_session_videos":        [v.name for v in videos],
                 "last_session_resume_offset": round(resume_offset, 3),
@@ -682,6 +684,9 @@ def play_videos(folder_entries: list, vlc_path: str, extensions: list,
                 new_state["resume_offset"] = resume_offset_save
             state[state_key] = new_state
             save_state(state)
+            threading.Thread(
+                target=_on_vlc_exit, args=(_active_proc, state_key), daemon=True
+            ).start()
 
     except FileNotFoundError:
         log.error(f"VLC executable not found at: {vlc_path}  — update config.json")
@@ -748,6 +753,74 @@ def _start_status_server(port: int) -> None:
                 time.sleep(1)
             else:
                 log.warning(f"Could not start status server on port {port} — continuing without it.")
+
+
+# ── Startup catch-up ─────────────────────────────────────────────────────────
+
+def _on_vlc_exit(proc: subprocess.Popen, state_key: str) -> None:
+    """Background thread: mark the session completed once VLC exits."""
+    try:
+        proc.wait(timeout=10800)  # give up after 3 h
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        state = load_state()
+        entry = state.get(state_key, {})
+        if isinstance(entry, dict):
+            entry["session_completed"] = True
+            state[state_key] = entry
+            save_state(state)
+    except Exception:
+        log.exception("Error marking session complete")
+
+
+def startup_catchup(config: dict, vlc_path: str, extensions: list) -> None:
+    """On startup, play the most recently missed or interrupted schedule slot."""
+    now   = datetime.datetime.now()
+    state = load_state()
+
+    candidates = []
+    for entry in config.get("schedules", []):
+        if "mirror" in entry:
+            continue
+        h, m = entry["time"].split(":")
+        today_dt     = now.replace(hour=int(h), minute=int(m), second=0, microsecond=0)
+        scheduled_dt = today_dt if today_dt <= now else today_dt - datetime.timedelta(days=1)
+        candidates.append((scheduled_dt, entry))
+
+    for scheduled_dt, entry in sorted(candidates, key=lambda x: x[0], reverse=True):
+        fes       = get_folder_entries(entry)
+        state_key = fes[0]["path"]
+        es        = state.get(state_key, {})
+        if isinstance(es, str):
+            es = {}
+
+        last_at = es.get("last_session_at")
+        if not last_at:
+            continue  # never played before — nothing to catch up
+
+        last_dt   = datetime.datetime.fromisoformat(last_at)
+        completed = es.get("session_completed", True)
+
+        missed      = last_dt < scheduled_dt
+        interrupted = (not missed) and not completed
+
+        if missed or interrupted:
+            reason = "missed" if missed else "interrupted"
+            log.info(
+                f"Startup catch-up: slot {entry['time']} was {reason} "
+                f"(last played {last_at}, slot was {scheduled_dt.strftime('%Y-%m-%d %H:%M')})"
+            )
+            end_time = entry.get("end_time")
+            window_seconds: Optional[float] = None
+            if end_time:
+                ws = _time_to_seconds(end_time) - _time_to_seconds(entry["time"])
+                if ws > 0:
+                    window_seconds = float(ws)
+            play_videos(fes, vlc_path, extensions, entry.get("before_play"), window_seconds)
+            return
+
+    log.info("Startup: no missed slots — resuming normal schedule.")
 
 
 # ── Schedule registration ─────────────────────────────────────────────────────
@@ -956,6 +1029,7 @@ def main() -> None:
     threading.Thread(target=_start_status_server, args=(port,), daemon=True).start()
 
     _register_schedules(config)
+    startup_catchup(config, vlc_path, extensions)
     log.info("Scheduler running — waiting for scheduled times.")
 
     while True:
