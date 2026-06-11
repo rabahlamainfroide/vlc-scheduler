@@ -685,7 +685,9 @@ def play_videos(folder_entries: list, vlc_path: str, extensions: list,
             state[state_key] = new_state
             save_state(state)
             threading.Thread(
-                target=_on_vlc_exit, args=(_active_proc, state_key), daemon=True
+                target=_on_vlc_exit,
+                args=(_active_proc, state_key, new_state["last_session_at"]),
+                daemon=True,
             ).start()
 
     except FileNotFoundError:
@@ -757,8 +759,14 @@ def _start_status_server(port: int) -> None:
 
 # ── Startup catch-up ─────────────────────────────────────────────────────────
 
-def _on_vlc_exit(proc: subprocess.Popen, state_key: str) -> None:
-    """Background thread: mark the session completed once VLC exits."""
+def _on_vlc_exit(proc: subprocess.Popen, state_key: str, session_at: str) -> None:
+    """Background thread: mark the session completed once VLC exits.
+
+    session_at is the last_session_at value written when this session started.
+    The write is skipped if a newer session has already replaced it, which
+    prevents a finishing slot from clobbering the 'completed=False' marker
+    written by a back-to-back slot that started at the same instant.
+    """
     try:
         proc.wait(timeout=10800)  # give up after 3 h
     except subprocess.TimeoutExpired:
@@ -766,7 +774,7 @@ def _on_vlc_exit(proc: subprocess.Popen, state_key: str) -> None:
     try:
         state = load_state()
         entry = state.get(state_key, {})
-        if isinstance(entry, dict):
+        if isinstance(entry, dict) and entry.get("last_session_at") == session_at:
             entry["session_completed"] = True
             state[state_key] = entry
             save_state(state)
