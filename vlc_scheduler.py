@@ -550,6 +550,15 @@ def play_videos(folder_entries: list, vlc_path: str, extensions: list,
                 videos, _, _ = get_next_videos(folder_entries, state, extensions)
                 resume_offset = 0.0
     else:
+        # get_next_videos_for_window/get_next_videos only ever read the live
+        # folder_index/last_played/resume_offset fields, which are only
+        # advanced once a session is confirmed (see _on_vlc_exit below and
+        # the comment above new_state further down).  If the previous
+        # session for this state_key never got to confirm — scheduler or
+        # machine died before VLC exited, e.g. a power cut — those fields
+        # are still exactly where they were before that attempt, so this
+        # call naturally re-selects the same interrupted batch instead of
+        # skipping past it.
         if window_seconds is not None:
             videos, folder_index, folder_path, resume_offset, new_resume_offset = \
                 get_next_videos_for_window(folder_entries, state, extensions, window_seconds)
@@ -672,19 +681,30 @@ def play_videos(folder_entries: list, vlc_path: str, extensions: list,
                 if window_seconds is not None:
                     log.info("Next session starts from beginning (no overshoot)")
 
+            # folder_index / last_played / resume_offset are left at their
+            # last CONFIRMED values (carried over from old_state) — NOT
+            # advanced yet.  The predicted post-session values go into
+            # pending_* and are only promoted to the live fields by
+            # _finalize_pending(), once _on_vlc_exit confirms VLC actually
+            # exited.  This is what lets a hard interruption (e.g. a power
+            # failure) resume by re-playing the in-flight batch instead of
+            # silently skipping past it.
             new_state = {
                 **prev,
-                "folder_index":               folder_index,
-                "last_played":                last_played_save,
+                "folder_index":               old_state.get("folder_index", 0),
+                "last_played":                old_state.get("last_played"),
                 "last_session_date":          today_str,
                 "last_session_at":            datetime.datetime.now().isoformat(),
                 "session_completed":          False,
                 "last_session_folder":        folder_path,
                 "last_session_videos":        [v.name for v in videos],
                 "last_session_resume_offset": round(resume_offset, 3),
+                "pending_folder_index":       folder_index,
+                "pending_last_played":        last_played_save,
             }
             if window_seconds is not None:
-                new_state["resume_offset"] = resume_offset_save
+                new_state["resume_offset"]         = old_state.get("resume_offset", 0.0)
+                new_state["pending_resume_offset"] = resume_offset_save
             state[state_key] = new_state
             save_state(state)
             threading.Thread(
@@ -762,8 +782,24 @@ def _start_status_server(port: int) -> None:
 
 # ── Startup catch-up ─────────────────────────────────────────────────────────
 
+def _finalize_pending(entry: dict) -> None:
+    """Promote a session's predicted rotation (pending_*) to the live fields.
+
+    Only called from _on_vlc_exit once VLC has actually, observably exited —
+    naturally or via a deliberate kill_vlc() from the next slot. Mutates
+    entry in place.
+    """
+    if "pending_folder_index" in entry:
+        entry["folder_index"] = entry.pop("pending_folder_index")
+    if "pending_last_played" in entry:
+        entry["last_played"] = entry.pop("pending_last_played")
+    if "pending_resume_offset" in entry:
+        entry["resume_offset"] = entry.pop("pending_resume_offset")
+    entry["session_completed"] = True
+
+
 def _on_vlc_exit(proc: subprocess.Popen, state_key: str, session_at: str) -> None:
-    """Background thread: mark the session completed once VLC exits.
+    """Background thread: confirm the session once VLC exits.
 
     session_at is the last_session_at value written when this session started.
     The write is skipped if a newer session has already replaced it, which
@@ -778,7 +814,7 @@ def _on_vlc_exit(proc: subprocess.Popen, state_key: str, session_at: str) -> Non
         state = load_state()
         entry = state.get(state_key, {})
         if isinstance(entry, dict) and entry.get("last_session_at") == session_at:
-            entry["session_completed"] = True
+            _finalize_pending(entry)
             state[state_key] = entry
             save_state(state)
     except Exception:
