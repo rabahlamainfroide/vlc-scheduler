@@ -397,15 +397,18 @@ def get_next_videos_for_window(
             resume_offset = 0.0
             continue
 
-        # Pick enough videos (wrapping within the folder) to fill window_seconds.
+        # Pick enough videos, from next_index to the end of the folder, to fill
+        # window_seconds.  Do NOT wrap back to the start of the same folder: if
+        # the folder runs out first, selection stops there so last_played lands
+        # on the true final video, which correctly signals "folder exhausted"
+        # and lets the next session advance to the next folder in the list.
         # The first video only contributes (duration - resume_offset) of content
         # because VLC will seek into it.
         total          = len(videos)
         selected       = []
         durations      = []
         total_duration = 0.0
-        for offset in range(total):
-            idx   = (next_index + offset) % total
+        for idx in range(next_index, total):
             video = videos[idx]
             dur   = get_video_duration(video)
             selected.append(video)
