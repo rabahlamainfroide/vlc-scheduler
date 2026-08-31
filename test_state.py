@@ -968,6 +968,140 @@ def test_an_unreadable_folder_leaves_the_rotation_alone():
         assert vs.load_state() == before, vs.load_state()
 
 
+# ── Folder rotation ───────────────────────────────────────────────────────────
+
+def _folder(tmp, name, count, ext=".mp4"):
+    folder = tmp / name
+    folder.mkdir()
+    for i in range(1, count + 1):
+        (folder / f"{i}{ext}").write_bytes(b"")
+    return folder
+
+
+def test_a_single_folder_slot_does_not_go_dark_when_it_finishes():
+    """Reaching the last episode used to select nothing, write nothing, and do
+    the same thing again every day after -- the slot never came back."""
+    with sandbox() as (vs, tmp):
+        vs.get_video_duration = lambda path: 1000.0
+        folder = _folder(tmp, "solo", 3)
+        state = {str(folder): {"folder_index": 0, "last_played": "3.mp4"}}
+
+        videos, _i, _p, _in, _out = vs.get_next_videos_for_window(
+            [{"path": str(folder), "count": 1}], state, [".mp4"], 1500.0)
+        assert [v.name for v in videos] == ["1.mp4", "2.mp4"], [v.name for v in videos]
+
+        videos, _i, _p = vs.get_next_videos(
+            [{"path": str(folder), "count": 1}], state, [".mp4"])
+        assert [v.name for v in videos] == ["1.mp4"], [v.name for v in videos]
+
+
+def test_returning_to_a_folder_resumes_where_it_was_left():
+    """Two folders, one cursor: coming back round used to restart at episode 1."""
+    with sandbox() as (vs, tmp):
+        vs.get_video_duration = lambda path: 1000.0
+        a, b = _folder(tmp, "A", 3), _folder(tmp, "B", 6)
+        fes = [{"path": str(a), "count": 1}, {"path": str(b), "count": 1}]
+        # Sitting at the end of A, having left B after its 4th episode.
+        state = {str(a): {
+            "folder_index": 0, "last_played": "3.mp4",
+            "folder_progress": {str(b): {"last_played": "4.mp4", "resume_offset": 25.0}},
+        }}
+
+        videos, folder_index, folder_path, offset_in, _out = \
+            vs.get_next_videos_for_window(fes, state, [".mp4"], 1500.0)
+        assert folder_index == 1 and folder_path == str(b), (folder_index, folder_path)
+        assert [v.name for v in videos] == ["5.mp4", "6.mp4"], [v.name for v in videos]
+        assert offset_in == 25.0, offset_in
+
+
+def test_a_count_based_slot_also_resumes_a_folder_where_it_was_left():
+    """The same rule for slots with no end_time, which use the other selector."""
+    with sandbox() as (vs, tmp):
+        a, b = _folder(tmp, "A", 3), _folder(tmp, "B", 6)
+        fes = [{"path": str(a), "count": 1}, {"path": str(b), "count": 1}]
+        state = {str(a): {
+            "folder_index": 0, "last_played": "3.mp4",
+            "folder_progress": {str(b): {"last_played": "4.mp4"}},
+        }}
+
+        videos, folder_index, _p = vs.get_next_videos(fes, state, [".mp4"])
+        assert folder_index == 1, folder_index
+        assert [v.name for v in videos] == ["5.mp4"], [v.name for v in videos]
+
+
+def test_episodes_added_since_a_folder_was_finished_are_picked_up():
+    """A folder is only ever left because it ran out, so its remembered
+    position is exactly what makes new episodes get played rather than the
+    whole series starting over."""
+    with sandbox() as (vs, tmp):
+        vs.get_video_duration = lambda path: 1000.0
+        a, b = _folder(tmp, "A", 5), _folder(tmp, "B", 2)   # A grew from 2 to 5
+        fes = [{"path": str(a), "count": 1}, {"path": str(b), "count": 1}]
+        state = {str(a): {
+            "folder_index": 1, "last_played": "2.mp4",       # B finished
+            "folder_progress": {str(a): {"last_played": "2.mp4"}},
+        }}
+
+        videos, folder_index, _p, _in, _out = vs.get_next_videos_for_window(
+            fes, state, [".mp4"], 1500.0)
+        assert folder_index == 0, folder_index
+        assert [v.name for v in videos] == ["3.mp4", "4.mp4"], [v.name for v in videos]
+
+
+def test_a_folder_still_finished_when_we_return_starts_over():
+    """Nothing new was added, so there is nowhere left to resume: play it
+    again rather than walking off the end looking for another folder."""
+    with sandbox() as (vs, tmp):
+        vs.get_video_duration = lambda path: 1000.0
+        a, b = _folder(tmp, "A", 2), _folder(tmp, "B", 2)
+        fes = [{"path": str(a), "count": 1}, {"path": str(b), "count": 1}]
+        state = {str(a): {
+            "folder_index": 0, "last_played": "2.mp4",
+            "folder_progress": {str(b): {"last_played": "2.mp4"}},
+        }}
+
+        videos, folder_index, _p, _in, _out = vs.get_next_videos_for_window(
+            fes, state, [".mp4"], 1500.0)
+        assert folder_index == 1, folder_index
+        assert [v.name for v in videos] == ["1.mp4", "2.mp4"], [v.name for v in videos]
+
+
+def test_a_confirmed_session_records_where_its_folder_was_left():
+    with sandbox() as (vs, _tmp):
+        entry = _session(pending_folder_index=1, pending_last_played="ep07",
+                         pending_resume_offset=12.0)
+        entry["pending_folder_path"] = "/videos/B"
+        vs.save_state({"A": entry})
+        vs._on_vlc_exit(_Proc(), "A", "T-A", time.monotonic() - 3600)
+
+        a = vs.load_state()["A"]
+        assert a["folder_progress"]["/videos/B"] == {
+            "last_played": "ep07", "resume_offset": 12.0}, a
+        assert "pending_folder_path" not in a, a
+
+
+def test_a_state_file_without_folder_progress_still_works():
+    """Every existing state file predates this, so the absence of the key has
+    to behave exactly as it did before."""
+    with sandbox() as (vs, tmp):
+        vs.get_video_duration = lambda path: 1000.0
+        a, b = _folder(tmp, "A", 2), _folder(tmp, "B", 3)
+        fes = [{"path": str(a), "count": 1}, {"path": str(b), "count": 1}]
+        state = {str(a): {"folder_index": 0, "last_played": "2.mp4"}}
+
+        videos, folder_index, _p, _in, _out = vs.get_next_videos_for_window(
+            fes, state, [".mp4"], 1500.0)
+        assert folder_index == 1, folder_index
+        assert [v.name for v in videos] == ["1.mp4", "2.mp4"], [v.name for v in videos]
+
+
+def test_shift_records_the_folder_it_lands_in():
+    with sandbox() as (vs, _tmp):
+        state = {}
+        vs._apply_manual_advance(state, "A", 1, "ep03", 0.0, "/videos/B")
+        assert state["A"]["folder_progress"]["/videos/B"]["last_played"] == "ep03", state
+
+
 def main() -> int:
     tests = [fn for name, fn in globals().items()
              if name.startswith("test_") and callable(fn)]
