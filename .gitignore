@@ -67,3 +67,6 @@ config.json
 # OS
 .DS_Store
 Thumbs.db
+playback_state.lock
+playback_state.json.tmp
+playback_state.json.bak-*

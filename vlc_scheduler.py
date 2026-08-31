@@ -6,7 +6,9 @@ State (last played index per folder) is persisted in playback_state.json.
 """
 
 import argparse
+import contextlib
 import datetime
+import fcntl
 import http.server
 import json
 import logging
@@ -27,10 +29,17 @@ except ImportError:
     sys.exit(1)
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-BASE_DIR    = Path(__file__).parent
-CONFIG_FILE = BASE_DIR / "config.json"
-STATE_FILE  = BASE_DIR / "playback_state.json"
-LOG_FILE    = BASE_DIR / "vlc_scheduler.log"
+BASE_DIR        = Path(__file__).parent
+CONFIG_FILE     = BASE_DIR / "config.json"
+STATE_FILE      = BASE_DIR / "playback_state.json"
+STATE_TMP_FILE  = BASE_DIR / "playback_state.json.tmp"
+STATE_LOCK_FILE = BASE_DIR / "playback_state.lock"
+LOG_FILE        = BASE_DIR / "vlc_scheduler.log"
+
+# A VLC session shorter than this never corresponds to a real slot (the
+# shortest configured window is an hour), so it means VLC crashed or was quit
+# moments after launch.  Such a session does not confirm a rotation.
+ABNORMAL_EXIT_SECONDS = 60.0
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -48,6 +57,7 @@ _active_proc: Optional[subprocess.Popen] = None
 _config_mtime: float = 0.0
 _dry_run: bool = False
 _current_config: dict = {}
+_state_lock = threading.Lock()
 
 # ── Default configuration (written on first run) ──────────────────────────────
 DEFAULT_CONFIG = {
@@ -218,8 +228,37 @@ def load_state() -> dict:
 
 
 def save_state(state: dict) -> None:
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
+    """Write the state file atomically: a crash mid-write cannot truncate it."""
+    with open(STATE_TMP_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(STATE_TMP_FILE, STATE_FILE)
+
+
+@contextlib.contextmanager
+def state_transaction():
+    """Load the state, yield it for mutation, then save it atomically.
+
+    EVERY writer must go through this.  The state file is rewritten whole, so
+    a writer that snapshots it early and saves later silently reverts every
+    key another writer touched in between — which is exactly how a slot's
+    launch used to erase the previous slot's rotation commit.
+
+    Held under a thread lock (for _on_vlc_exit threads inside this process)
+    and an flock (for a second process, e.g. --play-now, run by hand while the
+    daemon is up).  The lock lives in its own file because save_state()
+    replaces the state file's inode, which would drop an flock taken on it.
+    """
+    with _state_lock:
+        with open(STATE_LOCK_FILE, "w") as lockf:
+            fcntl.flock(lockf, fcntl.LOCK_EX)
+            try:
+                state = load_state()
+                yield state
+                save_state(state)
+            finally:
+                fcntl.flock(lockf, fcntl.LOCK_UN)
 
 
 # ── Video selection ───────────────────────────────────────────────────────────
@@ -511,7 +550,8 @@ def _run_hook(cmd: str) -> None:
 def play_videos(folder_entries: list, vlc_path: str, extensions: list,
                 before_play: Optional[str] = None,
                 window_seconds: Optional[float] = None,
-                is_mirror: bool = False) -> None:
+                is_mirror: bool = False,
+                wait_for_exit: bool = False) -> None:
     global _active_proc
 
     state     = load_state()
@@ -624,9 +664,56 @@ def play_videos(folder_entries: list, vlc_path: str, extensions: list,
 
         if is_mirror:
             log.info("[MIRROR] State unchanged — primary slot manages progression")
+            return
+
+        launched_at = time.monotonic()
+        today_str   = datetime.date.today().isoformat()
+
+        if window_seconds is not None and new_resume_offset > 0:
+            # Last selected episode was interrupted when the slot window ended (VLC
+            # is killed by the next slot).  Save state so the SAME episode is
+            # replayed next session from the point where it was cut off, not skipped.
+            last_ep_dur      = get_video_duration(videos[-1])
+            seek_into_last   = max(0.0, last_ep_dur - new_resume_offset)
+            # Find the true predecessor of the interrupted episode in the sorted
+            # folder list.  videos[-2] is wrong when the selection loop wrapped
+            # around to index 0: it would be the last file in the folder, which
+            # triggers a false exhaustion on the next session and skips the episode.
+            # Setting last_played=None when the interrupted episode is first (idx 0)
+            # causes next_index=0, so the episode is re-selected with the saved offset.
+            ext_set_scan  = {e.lower() for e in extensions}
+            all_sorted    = sorted(
+                [f for f in Path(folder_path).iterdir()
+                 if f.is_file() and f.suffix.lower() in ext_set_scan],
+                key=_natural_sort_key,
+            )
+            interrupted_idx  = next(
+                (i for i, f in enumerate(all_sorted) if f.name == videos[-1].name), -1
+            )
+            last_played_save = (
+                all_sorted[interrupted_idx - 1].name if interrupted_idx > 0 else None
+            )
+            resume_offset_save = round(seek_into_last, 3)
+            log.info(
+                f"Last episode interrupted — next session resumes {videos[-1].name}"
+                f" at {seek_into_last:.1f}s"
+            )
         else:
-            today_str   = datetime.date.today().isoformat()
-            old_state   = state.get(state_key, {})
+            last_played_save   = videos[-1].name
+            resume_offset_save = 0.0
+            if window_seconds is not None:
+                log.info("Next session starts from beginning (no overshoot)")
+
+        session_at = datetime.datetime.now().isoformat()
+
+        # Re-read the state under the lock rather than reusing the snapshot
+        # taken at the top of this function.  kill_vlc() above has just made
+        # the previous slot's VLC exit, so that slot's _on_vlc_exit thread is
+        # committing its rotation right about now.  The file is rewritten
+        # whole, so saving the stale snapshot here would revert that commit —
+        # which is what froze every folder on the same episodes.
+        with state_transaction() as fresh_state:
+            old_state = fresh_state.get(state_key, {})
             if isinstance(old_state, str):
                 old_state = {}
 
@@ -646,41 +733,6 @@ def play_videos(folder_entries: list, vlc_path: str, extensions: list,
                     ) if k in old_state
                 }
 
-            if window_seconds is not None and new_resume_offset > 0:
-                # Last selected episode was interrupted when the slot window ended (VLC
-                # is killed by the next slot).  Save state so the SAME episode is
-                # replayed next session from the point where it was cut off, not skipped.
-                last_ep_dur      = get_video_duration(videos[-1])
-                seek_into_last   = max(0.0, last_ep_dur - new_resume_offset)
-                # Find the true predecessor of the interrupted episode in the sorted
-                # folder list.  videos[-2] is wrong when the selection loop wrapped
-                # around to index 0: it would be the last file in the folder, which
-                # triggers a false exhaustion on the next session and skips the episode.
-                # Setting last_played=None when the interrupted episode is first (idx 0)
-                # causes next_index=0, so the episode is re-selected with the saved offset.
-                ext_set_scan  = {e.lower() for e in extensions}
-                all_sorted    = sorted(
-                    [f for f in Path(folder_path).iterdir()
-                     if f.is_file() and f.suffix.lower() in ext_set_scan],
-                    key=_natural_sort_key,
-                )
-                interrupted_idx  = next(
-                    (i for i, f in enumerate(all_sorted) if f.name == videos[-1].name), -1
-                )
-                last_played_save = (
-                    all_sorted[interrupted_idx - 1].name if interrupted_idx > 0 else None
-                )
-                resume_offset_save = round(seek_into_last, 3)
-                log.info(
-                    f"Last episode interrupted — next session resumes {videos[-1].name}"
-                    f" at {seek_into_last:.1f}s"
-                )
-            else:
-                last_played_save   = videos[-1].name
-                resume_offset_save = 0.0
-                if window_seconds is not None:
-                    log.info("Next session starts from beginning (no overshoot)")
-
             # folder_index / last_played / resume_offset are left at their
             # last CONFIRMED values (carried over from old_state) — NOT
             # advanced yet.  The predicted post-session values go into
@@ -694,7 +746,7 @@ def play_videos(folder_entries: list, vlc_path: str, extensions: list,
                 "folder_index":               old_state.get("folder_index", 0),
                 "last_played":                old_state.get("last_played"),
                 "last_session_date":          today_str,
-                "last_session_at":            datetime.datetime.now().isoformat(),
+                "last_session_at":            session_at,
                 "session_completed":          False,
                 "last_session_folder":        folder_path,
                 "last_session_videos":        [v.name for v in videos],
@@ -705,11 +757,17 @@ def play_videos(folder_entries: list, vlc_path: str, extensions: list,
             if window_seconds is not None:
                 new_state["resume_offset"]         = old_state.get("resume_offset", 0.0)
                 new_state["pending_resume_offset"] = resume_offset_save
-            state[state_key] = new_state
-            save_state(state)
+            fresh_state[state_key] = new_state
+
+        if wait_for_exit:
+            # One-shot invocation (--play-now): confirm the session in the
+            # foreground.  A daemon thread would die the instant main() returns,
+            # leaving pending_* unpromoted and this folder frozen forever.
+            _on_vlc_exit(_active_proc, state_key, session_at, launched_at)
+        else:
             threading.Thread(
                 target=_on_vlc_exit,
-                args=(_active_proc, state_key, new_state["last_session_at"]),
+                args=(_active_proc, state_key, session_at, launched_at),
                 daemon=True,
             ).start()
 
@@ -798,25 +856,70 @@ def _finalize_pending(entry: dict) -> None:
     entry["session_completed"] = True
 
 
-def _on_vlc_exit(proc: subprocess.Popen, state_key: str, session_at: str) -> None:
-    """Background thread: confirm the session once VLC exits.
+def _apply_manual_advance(state: dict, state_key: str, folder_index: int,
+                          last_played: str, resume_offset: Optional[float] = None) -> None:
+    """Force the live rotation fields forward for --advance.
+
+    Merges into the existing entry instead of replacing it, so the
+    last_session_*/prev_session_* history mirrors depend on survives.  Any
+    pending_* left over is dropped: it belongs to a session that is now
+    superseded, and promoting it later would undo this advance.
+    """
+    entry = state.get(state_key, {})
+    if not isinstance(entry, dict):
+        entry = {}
+    for key in ("pending_folder_index", "pending_last_played", "pending_resume_offset"):
+        entry.pop(key, None)
+    entry["folder_index"]      = folder_index
+    entry["last_played"]       = last_played
+    entry["session_completed"] = True
+    if resume_offset is not None:
+        entry["resume_offset"] = resume_offset
+    state[state_key] = entry
+
+
+def _on_vlc_exit(proc: subprocess.Popen, state_key: str, session_at: str,
+                 launched_at: float) -> None:
+    """Confirm the session once VLC has actually exited.
+
+    Waits without a timeout on purpose: the wait must end when VLC ends, never
+    on a clock.  A slot that plays past its window (the 21:00 one runs until
+    the 06:00 mirror kills it) used to trip a 3 h timeout and get marked
+    confirmed while it was still playing.
 
     session_at is the last_session_at value written when this session started.
     The write is skipped if a newer session has already replaced it, which
     prevents a finishing slot from clobbering the 'completed=False' marker
     written by a back-to-back slot that started at the same instant.
     """
+    proc.wait()
+
+    elapsed = time.monotonic() - launched_at
+    if elapsed < ABNORMAL_EXIT_SECONDS:
+        # No configured slot is this short, so VLC crashed or was quit right
+        # after launch.  Leaving pending_* unpromoted makes the next session
+        # replay this batch instead of rotating past content nobody watched.
+        log.warning(
+            f"VLC exited after only {elapsed:.1f}s — treating {state_key} as "
+            f"interrupted; rotation NOT advanced, this batch will replay."
+        )
+        return
+
     try:
-        proc.wait(timeout=10800)  # give up after 3 h
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        state = load_state()
-        entry = state.get(state_key, {})
-        if isinstance(entry, dict) and entry.get("last_session_at") == session_at:
-            _finalize_pending(entry)
-            state[state_key] = entry
-            save_state(state)
+        with state_transaction() as state:
+            entry = state.get(state_key, {})
+            if isinstance(entry, dict) and entry.get("last_session_at") == session_at:
+                _finalize_pending(entry)
+                state[state_key] = entry
+                log.info(
+                    f"Session confirmed for {state_key} after {elapsed/60:.0f}m — "
+                    f"rotation advanced to last_played={entry.get('last_played')!r}"
+                )
+            else:
+                log.info(
+                    f"Session for {state_key} superseded by a newer one — "
+                    f"leaving rotation to it."
+                )
     except Exception:
         log.exception("Error marking session complete")
 
@@ -982,7 +1085,11 @@ def main() -> None:
             ws = _time_to_seconds(entry["end_time"]) - _time_to_seconds(entry["time"])
             if ws > 0:
                 window_secs = float(ws)
-        play_videos(fes, vlc_path, extensions, (entry or {}).get("before_play"), window_secs)
+        # wait_for_exit: block until VLC ends so the session is confirmed before
+        # this process goes away.  Without it the rotation is left pending and
+        # this folder replays the same episodes on every future run.
+        play_videos(fes, vlc_path, extensions, (entry or {}).get("before_play"),
+                    window_secs, wait_for_exit=True)
         return
 
     # --peek: show next video(s) for a scheduled time without changing state
@@ -1024,12 +1131,9 @@ def main() -> None:
             if not videos:
                 print("No videos to advance.")
                 sys.exit(1)
-            state[fes[0]["path"]] = {
-                "folder_index": folder_index,
-                "last_played":  videos[-1].name,
-                "resume_offset": round(new_resume_offset, 3),
-            }
-            save_state(state)
+            with state_transaction() as st:
+                _apply_manual_advance(st, fes[0]["path"], folder_index,
+                                      videos[-1].name, round(new_resume_offset, 3))
             print(f"Simulated playback at {args.advance}–{end_time}  →  folder: {folder_path}")
             for v in videos:
                 print(f"  {v.name}")
@@ -1039,8 +1143,8 @@ def main() -> None:
             if not videos:
                 print("No videos to advance.")
                 sys.exit(1)
-            state[fes[0]["path"]] = {"folder_index": folder_index, "last_played": videos[-1].name}
-            save_state(state)
+            with state_transaction() as st:
+                _apply_manual_advance(st, fes[0]["path"], folder_index, videos[-1].name)
             print(f"Simulated playback at {args.advance}  →  folder: {folder_path}")
             for v in videos:
                 print(f"  {v.name}")
