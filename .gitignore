@@ -72,3 +72,17 @@ playback_state.json.tmp
 playback_state.json.bak-*
 playback_state.json.bak
 playback_state.json.corrupt-*
+
+# Editor rescue copies and old hand-made backups of the runtime files
+*.save
+_config.json
+
+# Terminal session transcripts kept next to the project
+mysession.txt
+
+# scp typos: `scp file host` (no colon) writes the file into the CWD named
+# after the host.  These are copies of whatever was being sent, not project
+# files -- delete them once you have the original somewhere safe.
+10.0.0.2
+chak@10.0.0.2
+*@10.0.0.2

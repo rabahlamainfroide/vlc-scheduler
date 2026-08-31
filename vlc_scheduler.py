@@ -450,6 +450,21 @@ def _cursor_to_state(sequence: list, cursor: int) -> tuple:
     return folder_index, None
 
 
+def _folder_memory(progress: dict, folder_path: str) -> tuple:
+    """(last_played, resume_offset) remembered for one folder of a slot.
+
+    A slot with several folders plays them as one long run, but it only ever
+    holds one live cursor.  Without a per-folder memory, coming back round to
+    a folder restarts it from episode 1 -- and since a folder is only ever left
+    because it was finished, that memory is also what picks up episodes added
+    to it in the meantime.
+    """
+    remembered = progress.get(folder_path)
+    if not isinstance(remembered, dict):
+        return None, 0.0
+    return remembered.get("last_played"), float(remembered.get("resume_offset") or 0.0)
+
+
 def _median(values: list) -> float:
     """Median of a non-empty list of floats."""
     ordered = sorted(values)
@@ -497,11 +512,16 @@ def get_next_videos(folder_entries: list, state: dict, extensions: list):
 
     folder_index = entry_state.get("folder_index", 0) % len(folder_entries)
     last_played  = entry_state.get("last_played")
+    progress     = entry_state.get("folder_progress") or {}
+    resumed      = False     # is last_played another folder's remembered position?
 
     ext_set = {e.lower() for e in extensions}
 
-    # Try each folder in sequence, starting from the current one
-    for _ in range(len(folder_entries)):
+    # One visit per folder, plus one: a folder that turns out to have been
+    # finished already is restarted from the top, and that restart must not eat
+    # the budget that lets the search reach every folder.  With a single folder
+    # the extra step is what stops an exhausted slot going dark for good.
+    for _ in range(len(folder_entries) + 1):
         fe          = folder_entries[folder_index]
         folder_path = fe["path"]
         count       = fe["count"]
@@ -532,16 +552,28 @@ def get_next_videos(folder_entries: list, state: dict, extensions: list):
                     break
 
         if next_index >= len(videos):
-            # Current folder exhausted — advance to the next one
-            next_folder_index = (folder_index + 1) % len(folder_entries)
-            log.info(
-                f"All videos played in {folder_path}"
-                + (f" — advancing to {folder_entries[next_folder_index]['path']}"
-                   if len(folder_entries) > 1 else " — wrapping back to first")
-            )
-            folder_index = next_folder_index
-            last_played  = None
-            continue
+            if resumed:
+                # We came here on a remembered position that is at the end of
+                # this folder: it was already finished last time round, so play
+                # it again from the top rather than walking off looking further.
+                log.info(f"{folder_path} was finished last time — starting it again")
+                next_index  = 0
+                last_played = None
+            else:
+                # Current folder exhausted — advance to the next one, resuming
+                # wherever that folder was left rather than at its episode 1.
+                next_folder_index = (folder_index + 1) % len(folder_entries)
+                log.info(
+                    f"All videos played in {folder_path}"
+                    + (f" — advancing to {folder_entries[next_folder_index]['path']}"
+                       if len(folder_entries) > 1 else " — wrapping back to first")
+                )
+                folder_index   = next_folder_index
+                last_played, _ = _folder_memory(progress, folder_entries[folder_index]["path"])
+                resumed        = True
+                if last_played:
+                    log.info(f"Resuming that folder after {last_played}")
+                continue
 
         total    = len(videos)
         selected = [videos[(next_index + offset) % total] for offset in range(count)]
@@ -574,10 +606,13 @@ def get_next_videos_for_window(
     folder_index  = entry_state.get("folder_index", 0) % len(folder_entries)
     last_played   = entry_state.get("last_played")
     resume_offset = float(entry_state.get("resume_offset", 0.0))
+    progress      = entry_state.get("folder_progress") or {}
+    resumed       = False    # is last_played another folder's remembered position?
 
     ext_set = {e.lower() for e in extensions}
 
-    for _ in range(len(folder_entries)):
+    # See get_next_videos: one visit per folder, plus one for a restart.
+    for _ in range(len(folder_entries) + 1):
         fe          = folder_entries[folder_index]
         folder_path = fe["path"]
         folder      = Path(folder_path)
@@ -609,16 +644,27 @@ def get_next_videos_for_window(
                     break
 
         if next_index >= len(videos):
-            next_folder_index = (folder_index + 1) % len(folder_entries)
-            log.info(
-                f"All videos played in {folder_path}"
-                + (f" — advancing to {folder_entries[next_folder_index]['path']}"
-                   if len(folder_entries) > 1 else " — wrapping back to first")
-            )
-            folder_index  = next_folder_index
-            last_played   = None
-            resume_offset = 0.0
-            continue
+            if resumed:
+                log.info(f"{folder_path} was finished last time — starting it again")
+                next_index    = 0
+                last_played   = None
+                resume_offset = 0.0
+            else:
+                next_folder_index = (folder_index + 1) % len(folder_entries)
+                log.info(
+                    f"All videos played in {folder_path}"
+                    + (f" — advancing to {folder_entries[next_folder_index]['path']}"
+                       if len(folder_entries) > 1 else " — wrapping back to first")
+                )
+                folder_index = next_folder_index
+                last_played, resume_offset = _folder_memory(
+                    progress, folder_entries[folder_index]["path"]
+                )
+                resumed = True
+                if last_played:
+                    log.info(f"Resuming that folder after {last_played}"
+                             + (f" at {resume_offset:.1f}s" if resume_offset else ""))
+                continue
 
         # Pick enough videos, from next_index to the end of the folder, to fill
         # window_seconds.  Do NOT wrap back to the start of the same folder: if
@@ -1130,6 +1176,7 @@ def play_videos(folder_entries: list, vlc_path: str, extensions: list,
                 "last_session_videos":        [v.name for v in videos],
                 "last_session_resume_offset": round(resume_offset, 3),
                 "pending_folder_index":       folder_index,
+                "pending_folder_path":        folder_path,
                 "pending_last_played":        last_played_save,
             }
             if window_seconds is not None:
@@ -1248,6 +1295,20 @@ def _start_status_server(port: int) -> None:
 
 # ── Startup catch-up ─────────────────────────────────────────────────────────
 
+def _remember_folder(entry: dict, folder_path: Optional[str]) -> None:
+    """Record where the folder just played was left, so returning to it later
+    resumes there instead of at its first episode.  Mutates entry in place."""
+    if not folder_path:
+        return
+    progress = entry.setdefault("folder_progress", {})
+    if not isinstance(progress, dict):
+        progress = entry["folder_progress"] = {}
+    progress[folder_path] = {
+        "last_played":   entry.get("last_played"),
+        "resume_offset": entry.get("resume_offset", 0.0),
+    }
+
+
 def _finalize_pending(entry: dict) -> None:
     """Promote a session's predicted rotation (pending_*) to the live fields.
 
@@ -1261,11 +1322,13 @@ def _finalize_pending(entry: dict) -> None:
         entry["last_played"] = entry.pop("pending_last_played")
     if "pending_resume_offset" in entry:
         entry["resume_offset"] = entry.pop("pending_resume_offset")
+    _remember_folder(entry, entry.pop("pending_folder_path", None))
     entry["session_completed"] = True
 
 
 def _apply_manual_advance(state: dict, state_key: str, folder_index: int,
-                          last_played: str, resume_offset: Optional[float] = None) -> None:
+                          last_played: str, resume_offset: Optional[float] = None,
+                          folder_path: Optional[str] = None) -> None:
     """Force the live rotation fields forward for --advance.
 
     Merges into the existing entry instead of replacing it, so the
@@ -1283,6 +1346,7 @@ def _apply_manual_advance(state: dict, state_key: str, folder_index: int,
     entry["session_completed"] = True
     if resume_offset is not None:
         entry["resume_offset"] = resume_offset
+    _remember_folder(entry, folder_path)
     state[state_key] = entry
 
 
@@ -1610,7 +1674,8 @@ def main() -> None:
                 sys.exit(1)
             with state_transaction() as st:
                 _apply_manual_advance(st, fes[0]["path"], folder_index,
-                                      videos[-1].name, round(new_resume_offset, 3))
+                                      videos[-1].name, round(new_resume_offset, 3),
+                                      folder_path)
             print(f"Simulated playback at {args.advance}–{end_time}  →  folder: {folder_path}")
             for v in videos:
                 print(f"  {v.name}")
@@ -1621,7 +1686,8 @@ def main() -> None:
                 print("No videos to advance.")
                 sys.exit(1)
             with state_transaction() as st:
-                _apply_manual_advance(st, fes[0]["path"], folder_index, videos[-1].name)
+                _apply_manual_advance(st, fes[0]["path"], folder_index, videos[-1].name,
+                                      folder_path=folder_path)
             print(f"Simulated playback at {args.advance}  →  folder: {folder_path}")
             for v in videos:
                 print(f"  {v.name}")
@@ -1689,7 +1755,8 @@ def main() -> None:
 
         with state_transaction() as st:
             _apply_manual_advance(st, state_key, new_index, new_last,
-                                  None if args.keep_offset else 0.0)
+                                  None if args.keep_offset else 0.0,
+                                  fes[new_index]["path"])
         print("State updated.")
 
         # Show the real selection rather than asserting it: this runs the same

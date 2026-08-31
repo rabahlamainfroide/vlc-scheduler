@@ -8,6 +8,7 @@ Automatically plays the next numbered video(s) from designated folders at schedu
 - **Time-window scheduling**: Set a `start_time` + `end_time` and the scheduler automatically calculates how many episodes are needed to fill the slot. The overshoot is tracked so the next session seeks into the first episode to stay perfectly aligned across days
 - **Mirror slots**: Mark a slot as `"mirror": "HH:MM"` to make it an exact replica of another slot — same episodes, same seek offset, no state advancement
 - **Sequential Playback**: Plays numbered videos in order (001.mp4, 002.mp4, …); when a folder is exhausted it advances to the next folder in the list, wrapping back to the first after the last
+- **Per-folder resume**: A slot with several folders remembers where it left each one, so coming back round resumes there — and picks up episodes added in the meantime — instead of restarting at episode 1
 - **Multi-video batches**: Play N videos back-to-back per schedule slot, with a per-folder count
 - **State Persistence**: Remembers the last played video, active folder, and session overshoot offset across restarts
 - **Multiple Format Support**: MP4, AVI, MKV, MOV, WMV, FLV, and more
@@ -501,6 +502,26 @@ A mirror slot plays the exact same episodes as its primary slot, with the same s
 **If the primary fires first:** the primary saves a `last_session` snapshot (folder, filenames, `resume_offset` used). When the mirror fires later, it reads that snapshot and replays identically.
 
 **If the mirror fires first:** no snapshot exists yet, so the mirror computes the same selection the primary would (same state, same window) and plays it without writing anything to state. The primary then fires normally and advances the queue.
+
+### How a slot with several folders rotates
+
+Folders in one slot play as a single run: all of the first, then all of the
+second, then back to the first. Each folder's position is remembered
+separately, which matters because a folder is only ever left behind when it
+runs out:
+
+```
+hs  ep1 … ep141   (finished)  ──▶  sk  ep1 … ep164   (finished)  ──▶  back to hs
+                                                                       │
+       hs remembered at ep141; 6 new episodes arrived meanwhile  ◀──────┘
+       so it resumes at ep142 rather than replaying from ep1
+```
+
+If nothing new has been added, the folder genuinely has nothing left and is
+played again from the beginning.
+
+A slot with a **single** folder does the same thing on a smaller scale: when it
+reaches the last episode it starts over from the first.
 
 ### How the screen watchdog works
 
