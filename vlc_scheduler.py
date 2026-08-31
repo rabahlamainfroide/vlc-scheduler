@@ -33,6 +33,7 @@ BASE_DIR        = Path(__file__).parent
 CONFIG_FILE     = BASE_DIR / "config.json"
 STATE_FILE      = BASE_DIR / "playback_state.json"
 STATE_TMP_FILE  = BASE_DIR / "playback_state.json.tmp"
+STATE_BAK_FILE  = BASE_DIR / "playback_state.json.bak"
 STATE_LOCK_FILE = BASE_DIR / "playback_state.lock"
 LOG_FILE        = BASE_DIR / "vlc_scheduler.log"
 
@@ -220,19 +221,72 @@ def validate_config(config: dict) -> bool:
     return True
 
 
+def _quarantine(path: Path) -> None:
+    """Move an unreadable state file aside so it is not read again."""
+    if not path.exists():
+        return
+    stamp  = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    target = path.with_name(f"{path.name}.corrupt-{stamp}")
+    try:
+        os.replace(path, target)
+        log.error(f"Moved unreadable {path.name} aside as {target.name}")
+    except OSError:
+        log.exception(f"Could not move {path.name} aside")
+
+
 def load_state() -> dict:
-    if not STATE_FILE.exists():
-        return {}
-    with open(STATE_FILE, encoding="utf-8") as f:
-        return json.load(f)
+    """Read the playback state, falling back to the last good copy.
+
+    Never raises.  This runs on the startup path of an unattended kiosk whose
+    .xinitrc respawns the scheduler every 5s, so letting a damaged file raise
+    turns one bad write into a permanent crash loop.  Losing a session's
+    progress beats a machine that will not play anything until someone logs in.
+    """
+    for path, label in ((STATE_FILE, "state file"), (STATE_BAK_FILE, "state backup")):
+        if not path.exists():
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+            log.error(f"Unreadable {label} ({path.name}): {exc}")
+            continue
+        if not isinstance(data, dict):
+            log.error(f"{label} ({path.name}) is not a JSON object — ignoring it")
+            continue
+        if path is STATE_BAK_FILE:
+            log.warning(
+                f"Recovered playback state from {path.name} — at most one "
+                f"session's progress is lost."
+            )
+            _quarantine(STATE_FILE)
+        return data
+
+    if STATE_FILE.exists() or STATE_BAK_FILE.exists():
+        log.error(
+            "No readable playback state — starting from scratch. Every folder "
+            "will restart from its first episode; the damaged files are kept."
+        )
+        _quarantine(STATE_FILE)
+        _quarantine(STATE_BAK_FILE)
+    return {}
 
 
 def save_state(state: dict) -> None:
-    """Write the state file atomically: a crash mid-write cannot truncate it."""
+    """Write the state file atomically, keeping the previous copy as a fallback.
+
+    The backup is taken from the file about to be replaced, which was itself
+    written atomically, so it is always a complete generation behind.
+    """
     with open(STATE_TMP_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
         f.flush()
         os.fsync(f.fileno())
+    if STATE_FILE.exists():
+        try:
+            shutil.copy2(STATE_FILE, STATE_BAK_FILE)
+        except OSError:
+            log.exception("Could not refresh the state backup — continuing")
     os.replace(STATE_TMP_FILE, STATE_FILE)
 
 
@@ -1048,14 +1102,39 @@ def startup_catchup(config: dict, vlc_path: str, extensions: list) -> None:
 
     candidates = []
     for entry in config.get("schedules", []):
-        if "mirror" in entry:
-            continue
         h, m = entry["time"].split(":")
         today_dt     = now.replace(hour=int(h), minute=int(m), second=0, microsecond=0)
         scheduled_dt = today_dt if today_dt <= now else today_dt - datetime.timedelta(days=1)
         candidates.append((scheduled_dt, entry))
 
     for scheduled_dt, entry in sorted(candidates, key=lambda x: x[0], reverse=True):
+        if "mirror" in entry:
+            # A mirror records no state, so there is nothing to call missed or
+            # interrupted -- which used to mean a power cut during a morning
+            # mirror left the screen dark until the next primary hours later.
+            # Its window still being open is reason enough to play it, and
+            # replaying one is harmless because it rotates nothing.
+            window = _window_seconds(entry)
+            if window is None:
+                continue
+            if now >= scheduled_dt + datetime.timedelta(seconds=window):
+                continue  # the window has closed; fall through to older slots
+            primary, _ = _find_schedule(config, entry["time"])
+            if primary is None:
+                log.error(f"Startup catch-up: mirror {entry['time']} points at "
+                          f"'{entry['mirror']}', which is not a schedule — skipping")
+                continue
+            log.info(
+                f"Startup catch-up: mirror slot {entry['time']} is still inside "
+                f"its window — replaying {primary['time']}'s session"
+            )
+            play_videos(
+                get_folder_entries(primary), vlc_path, extensions,
+                entry.get("before_play") or primary.get("before_play"),
+                _window_seconds(primary), True,
+            )
+            return
+
         fes       = get_folder_entries(entry)
         state_key = fes[0]["path"]
         es        = state.get(state_key, {})

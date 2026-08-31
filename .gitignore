@@ -70,3 +70,5 @@ Thumbs.db
 playback_state.lock
 playback_state.json.tmp
 playback_state.json.bak-*
+playback_state.json.bak
+playback_state.json.corrupt-*

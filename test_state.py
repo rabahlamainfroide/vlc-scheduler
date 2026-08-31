@@ -422,6 +422,106 @@ def test_status_payload_covers_every_schedule():
         assert [r["time"] for r in rows] == ["15:00", "08:00", "07:00"]
 
 
+# ── Surviving a power cut ─────────────────────────────────────────────────────
+
+def test_corrupt_state_falls_back_to_the_backup():
+    """A torn state file must not take the kiosk down."""
+    with sandbox() as (vs, _tmp):
+        vs.save_state({"A": {"last_played": "ep01"}})
+        vs.save_state({"A": {"last_played": "ep02"}})   # ep01 becomes the backup
+        vs.STATE_FILE.write_text('{"A": {"last_pla')     # a torn write
+
+        state = vs.load_state()
+        assert state == {"A": {"last_played": "ep01"}}, state
+        assert list(vs.STATE_FILE.parent.glob("*.corrupt-*")), "bad file not quarantined"
+        assert not vs.STATE_FILE.exists(), "the corrupt file should have been moved aside"
+
+
+def test_corrupt_state_with_no_backup_starts_fresh_without_raising():
+    with sandbox() as (vs, _tmp):
+        vs.STATE_FILE.write_text("not json at all")
+        assert vs.load_state() == {}
+        assert list(vs.STATE_FILE.parent.glob("*.corrupt-*"))
+
+
+def test_state_that_is_valid_json_but_not_an_object_is_rejected():
+    with sandbox() as (vs, _tmp):
+        vs.STATE_FILE.write_text("[1, 2, 3]")
+        assert vs.load_state() == {}
+
+
+def test_missing_state_file_is_not_an_error():
+    with sandbox() as (vs, _tmp):
+        assert vs.load_state() == {}
+        assert not list(vs.STATE_FILE.parent.glob("*.corrupt-*")), \
+            "nothing to quarantine when there was never a state file"
+
+
+def test_backup_trails_the_live_file_by_one_generation():
+    with sandbox() as (vs, _tmp):
+        vs.save_state({"n": 1})
+        assert not vs.STATE_BAK_FILE.exists(), "nothing to back up on the first write"
+        vs.save_state({"n": 2})
+        assert json.loads(vs.STATE_BAK_FILE.read_text()) == {"n": 1}
+        vs.save_state({"n": 3})
+        assert json.loads(vs.STATE_BAK_FILE.read_text()) == {"n": 2}
+        assert json.loads(vs.STATE_FILE.read_text()) == {"n": 3}
+
+
+def _catchup_config(vs, tmp, now, mirror_offset_h, primary_offset_h):
+    """A primary later today plus a mirror `mirror_offset_h` hours ago."""
+    import datetime
+    primary_at = (now + datetime.timedelta(hours=primary_offset_h)).replace(second=0, microsecond=0)
+    mirror_at  = (now - datetime.timedelta(hours=mirror_offset_h)).replace(second=0, microsecond=0)
+    folder = tmp / "series"
+    if not folder.exists():
+        folder.mkdir()
+        for i in range(1, 4):
+            (folder / f"{i}.mp4").write_bytes(b"")
+    config = {"video_extensions": [".mp4"], "schedules": [
+        {"time": primary_at.strftime("%H:%M"),
+         "end_time": (primary_at + datetime.timedelta(hours=1)).strftime("%H:%M"),
+         "folders": [{"path": str(folder)}]},
+        {"time": mirror_at.strftime("%H:%M"),
+         "end_time": (mirror_at + datetime.timedelta(hours=2)).strftime("%H:%M"),
+         "mirror": primary_at.strftime("%H:%M")},
+    ]}
+    # the primary ran cleanly yesterday, at its own time
+    ran = (primary_at - datetime.timedelta(days=1)).replace(second=5, microsecond=0)
+    vs.save_state({str(folder): {
+        "folder_index": 0, "last_played": "1.mp4", "resume_offset": 0.0,
+        "last_session_at": ran.isoformat(), "session_completed": True,
+        "last_session_folder": str(folder), "last_session_videos": ["1.mp4"],
+        "last_session_resume_offset": 0.0,
+    }})
+    return config, folder
+
+
+def test_catchup_replays_a_mirror_whose_window_is_still_open():
+    """A power cut during a morning mirror used to leave the screen dark."""
+    import datetime
+    with sandbox() as (vs, tmp):
+        now = datetime.datetime.now()
+        config, _folder = _catchup_config(vs, tmp, now, mirror_offset_h=1, primary_offset_h=4)
+        played = []
+        vs.play_videos = lambda *a, **k: played.append((a, k))
+        vs.startup_catchup(config, "/bin/true", [".mp4"])
+        assert played, "mirror inside its window was not replayed"
+        assert played[0][0][5] is True, "must be played as a mirror (writes no state)"
+
+
+def test_catchup_ignores_a_mirror_whose_window_has_closed():
+    import datetime
+    with sandbox() as (vs, tmp):
+        now = datetime.datetime.now()
+        # window is 2h; 3h ago means it closed an hour back
+        config, _folder = _catchup_config(vs, tmp, now, mirror_offset_h=3, primary_offset_h=4)
+        played = []
+        vs.play_videos = lambda *a, **k: played.append((a, k))
+        vs.startup_catchup(config, "/bin/true", [".mp4"])
+        assert not played, "a closed mirror window must not trigger playback"
+
+
 def main() -> int:
     tests = [fn for name, fn in globals().items()
              if name.startswith("test_") and callable(fn)]
