@@ -608,6 +608,40 @@ python3 vlc_scheduler.py --advance 13:00
 
 Useful for skipping videos or fast-forwarding through the sequence during testing.
 
+### Shift a slot's position
+
+Move a slot forward or backward by a number of episodes, without playing anything and without editing `playback_state.json` by hand:
+
+```bash
+python3 vlc_scheduler.py --shift 15:00 +2     # skip two episodes ahead
+python3 vlc_scheduler.py --shift 15:00 -1     # go back one episode
+```
+
+```
+# Slot 15:00  →  /home/user/videos/series_A
+#   before:  EP28.mkv  @1981.8s
+#   after:   EP30.mkv  @0.0s   (+2 episode(s))
+#   resume_offset reset 1981.8s → 0.0s (pass --keep-offset to hold the slot's alignment)
+# State updated.
+# Next session at 15:00 would play (first seeked to 0.0s):
+#   EP30.mkv
+#   EP31.mkv
+```
+
+`SLOT` is a schedule time (`15:00`) or a folder path (`/home/user/videos/series_A`). Naming a mirror slot shifts the primary it replays, since mirrors hold no state of their own.
+
+By default the resume offset is reset to `0`, so the target episode starts from the beginning — that is almost always what you want when correcting a slot by hand. Pass `--keep-offset` to move the episode while holding the slot's alignment with its time window:
+
+```bash
+python3 vlc_scheduler.py --shift 15:00 +2 --keep-offset
+#   before:  EP28.mkv  @1981.8s
+#   after:   EP30.mkv  @1981.8s
+```
+
+Add `--dry-run` to preview without writing. Movement is clamped at both ends of the slot rather than wrapping, and a slot whose folders are all exhausted rolls over to the first folder on its next session, as usual.
+
+For a slot spanning several folders, the folders count as one continuous run, so stepping back off the first episode of one folder lands on the last episode of the previous one and moves `folder_index` with it.
+
 ### Status endpoint
 
 ```bash

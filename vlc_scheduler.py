@@ -275,6 +275,99 @@ def _time_to_seconds(t: str) -> int:
     return int(h) * 3600 + int(m) * 60
 
 
+def _window_seconds(entry: dict) -> Optional[float]:
+    """Length of a slot's play window in seconds, or None if it has no end_time."""
+    end_time = entry.get("end_time")
+    if not end_time:
+        return None
+    try:
+        ws = _time_to_seconds(end_time) - _time_to_seconds(entry["time"])
+    except (ValueError, KeyError):
+        return None
+    return float(ws) if ws > 0 else None
+
+
+def _find_schedule(config: dict, ident: str) -> tuple:
+    """Resolve 'HH:MM' or a folder path to the slot that owns the rotation.
+
+    Returns (primary_entry, mirror_entry_or_None).  A mirror slot has no
+    folders of its own -- it replays whatever the primary it points at played
+    -- so state operations on a mirror have to be redirected to that primary.
+    """
+    entry = next((e for e in config.get("schedules", []) if e["time"] == ident), None)
+    if entry is None:
+        entry = next(
+            (e for e in config.get("schedules", [])
+             if "mirror" not in e
+             and ident in [fe["path"] for fe in get_folder_entries(e)]),
+            None,
+        )
+    if entry is None:
+        return None, None
+    if "mirror" in entry:
+        primary = next(
+            (e for e in config.get("schedules", []) if e["time"] == entry["mirror"]), None
+        )
+        return primary, entry
+    return entry, None
+
+
+def _slot_sequence(folder_entries: list, extensions: list) -> list:
+    """[(folder_index, Path), ...] in the order this slot plays them.
+
+    A slot's folders are played as one concatenated run -- all of folder 0,
+    then all of folder 1 -- so flattening them gives a single line to move
+    along, and stepping back off the front of one folder lands on the tail of
+    the one before it.
+    """
+    ext_set = {e.lower() for e in extensions}
+    sequence = []
+    for index, fe in enumerate(folder_entries):
+        folder = Path(fe["path"])
+        if not folder.exists():
+            log.warning(f"Folder not found, skipping: {fe['path']}")
+            continue
+        videos = sorted(
+            [f for f in folder.iterdir() if f.is_file() and f.suffix.lower() in ext_set],
+            key=_natural_sort_key,
+        )
+        sequence.extend((index, v) for v in videos)
+    return sequence
+
+
+def _state_to_cursor(sequence: list, folder_index: int, last_played: Optional[str]) -> int:
+    """Position in `sequence` of the episode this slot would play next."""
+    if last_played is not None:
+        for i, (fi, video) in enumerate(sequence):
+            if fi == folder_index and video.name == last_played:
+                return i + 1
+        log.warning(
+            f"last_played {last_played!r} is no longer in folder {folder_index} — "
+            f"treating the slot as sitting at that folder's first episode"
+        )
+    for i, (fi, _video) in enumerate(sequence):
+        if fi == folder_index:
+            return i
+    return 0
+
+
+def _cursor_to_state(sequence: list, cursor: int) -> tuple:
+    """Inverse of _state_to_cursor: (folder_index, last_played) for a position.
+
+    last_played is the episode *before* the cursor within the same folder, or
+    None when the cursor sits on a folder's first episode -- which is how the
+    selectors spell "start of this folder".  A cursor past the end means the
+    last folder is exhausted, which is what makes the next session roll over.
+    """
+    if cursor >= len(sequence):
+        folder_index, video = sequence[-1]
+        return folder_index, video.name
+    folder_index, _video = sequence[cursor]
+    if cursor > 0 and sequence[cursor - 1][0] == folder_index:
+        return folder_index, sequence[cursor - 1][1].name
+    return folder_index, None
+
+
 def get_video_duration(path: Path) -> float:
     """Return video duration in seconds via ffprobe, or 0.0 on failure."""
     try:
@@ -961,13 +1054,8 @@ def startup_catchup(config: dict, vlc_path: str, extensions: list) -> None:
                 f"Startup catch-up: slot {entry['time']} was {reason} "
                 f"(last played {last_at}, slot was {scheduled_dt.strftime('%Y-%m-%d %H:%M')})"
             )
-            end_time = entry.get("end_time")
-            window_seconds: Optional[float] = None
-            if end_time:
-                ws = _time_to_seconds(end_time) - _time_to_seconds(entry["time"])
-                if ws > 0:
-                    window_seconds = float(ws)
-            play_videos(fes, vlc_path, extensions, entry.get("before_play"), window_seconds)
+            play_videos(fes, vlc_path, extensions, entry.get("before_play"),
+                        _window_seconds(entry))
             return
 
     log.info("Startup: no missed slots — resuming normal schedule.")
@@ -993,12 +1081,7 @@ def _register_schedules(config: dict) -> None:
                 log.error(f"  Schedule {t}: mirror target '{ref_time}' not found — skipping")
                 continue
             fes         = get_folder_entries(ref_entry)
-            ref_end     = ref_entry.get("end_time")
-            window_seconds: Optional[float] = None
-            if ref_end:
-                ws = _time_to_seconds(ref_end) - _time_to_seconds(ref_entry["time"])
-                if ws > 0:
-                    window_seconds = float(ws)
+            window_seconds = _window_seconds(ref_entry)
             if before_play is None:
                 before_play = ref_entry.get("before_play")
             log.info(f"  Registered  {t}  →  mirror of {ref_time}  ({fes[0]['path']})")
@@ -1007,14 +1090,9 @@ def _register_schedules(config: dict) -> None:
             )
             continue
 
-        end_time    = entry.get("end_time")
-        fes         = get_folder_entries(entry)
-
-        window_seconds = None
-        if end_time:
-            ws = _time_to_seconds(end_time) - _time_to_seconds(t)
-            if ws > 0:
-                window_seconds = float(ws)
+        end_time       = entry.get("end_time")
+        fes            = get_folder_entries(entry)
+        window_seconds = _window_seconds(entry)
 
         for fe in fes:
             if window_seconds is not None:
@@ -1049,6 +1127,17 @@ def main() -> None:
         help="Simulate one playback at the given scheduled time: advance state without launching VLC",
     )
     parser.add_argument(
+        "--shift", nargs=2, metavar=("SLOT", "N"),
+        help="Move a slot's position by N episodes without playing anything. "
+             "SLOT is a schedule time (HH:MM) or a folder path; N is signed, "
+             "e.g. --shift 15:00 +2  or  --shift 15:00 -1",
+    )
+    parser.add_argument(
+        "--keep-offset", action="store_true",
+        help="With --shift, keep the current resume_offset instead of resetting "
+             "it to 0 (keeps the slot aligned to its time window)",
+    )
+    parser.add_argument(
         "--play-file", metavar="FILE",
         help="Immediately play a specific video file and exit (does not affect playback state)",
     )
@@ -1080,11 +1169,7 @@ def main() -> None:
             None,
         )
         fes          = get_folder_entries(entry) if entry else [{"path": args.play_now, "count": 1}]
-        window_secs  = None
-        if entry and entry.get("end_time"):
-            ws = _time_to_seconds(entry["end_time"]) - _time_to_seconds(entry["time"])
-            if ws > 0:
-                window_secs = float(ws)
+        window_secs  = _window_seconds(entry) if entry else None
         # wait_for_exit: block until VLC ends so the session is confirmed before
         # this process goes away.  Without it the rotation is left pending and
         # this folder replays the same episodes on every future run.
@@ -1094,22 +1179,24 @@ def main() -> None:
 
     # --peek: show next video(s) for a scheduled time without changing state
     if args.peek:
-        entry = next((e for e in config["schedules"] if e["time"] == args.peek), None)
+        entry, mirror = _find_schedule(config, args.peek)
         if not entry:
-            print(f"No schedule found for time: {args.peek}")
+            print(f"No schedule found for: {args.peek}")
             sys.exit(1)
+        if mirror:
+            print(f"{args.peek} mirrors {entry['time']} — showing {entry['time']}.")
         fes      = get_folder_entries(entry)
         state    = load_state()
         end_time = entry.get("end_time")
-        if end_time:
-            ws = _time_to_seconds(end_time) - _time_to_seconds(entry["time"])
+        ws       = _window_seconds(entry)
+        if ws is not None:
             videos, _, folder_path, resume_offset, new_resume_offset = \
-                get_next_videos_for_window(fes, state, extensions, float(ws))
-            print(f"Schedule {args.peek}–{end_time}  →  folder: {folder_path}")
+                get_next_videos_for_window(fes, state, extensions, ws)
+            print(f"Schedule {entry['time']}–{end_time}  →  folder: {folder_path}")
             print(f"Resume offset: {resume_offset:.1f}s  |  Next session offset: {new_resume_offset:.1f}s")
         else:
             videos, _, folder_path = get_next_videos(fes, state, extensions)
-            print(f"Schedule {args.peek}  →  folder: {folder_path}")
+            print(f"Schedule {entry['time']}  →  folder: {folder_path}")
         for v in videos:
             dur = f"  ({get_video_duration(v):.0f}s)" if end_time else ""
             print(f"  {v.name}{dur}")
@@ -1117,17 +1204,19 @@ def main() -> None:
 
     # --advance: advance state as if one playback ran at a scheduled time
     if args.advance:
-        entry = next((e for e in config["schedules"] if e["time"] == args.advance), None)
+        entry, mirror = _find_schedule(config, args.advance)
         if not entry:
-            print(f"No schedule found for time: {args.advance}")
+            print(f"No schedule found for: {args.advance}")
             sys.exit(1)
+        if mirror:
+            print(f"{args.advance} mirrors {entry['time']} — advancing {entry['time']}.")
         fes      = get_folder_entries(entry)
         state    = load_state()
         end_time = entry.get("end_time")
-        if end_time:
-            ws = _time_to_seconds(end_time) - _time_to_seconds(entry["time"])
+        ws       = _window_seconds(entry)
+        if ws is not None:
             videos, folder_index, folder_path, resume_offset, new_resume_offset = \
-                get_next_videos_for_window(fes, state, extensions, float(ws))
+                get_next_videos_for_window(fes, state, extensions, ws)
             if not videos:
                 print("No videos to advance.")
                 sys.exit(1)
@@ -1149,6 +1238,85 @@ def main() -> None:
             for v in videos:
                 print(f"  {v.name}")
         print("State updated.")
+        return
+
+    # --shift: move a slot forward/backward by N episodes, without playing
+    if args.shift:
+        ident, raw_delta = args.shift
+        try:
+            delta = int(raw_delta)
+        except ValueError:
+            print(f"N must be a whole number of episodes, got: {raw_delta!r}")
+            sys.exit(1)
+
+        entry, mirror = _find_schedule(config, ident)
+        if not entry:
+            print(f"No schedule found for: {ident}")
+            sys.exit(1)
+        if mirror:
+            print(f"{ident} mirrors {entry['time']} — mirrors replay whatever the "
+                  f"primary played, so shifting {entry['time']} instead.")
+
+        fes       = get_folder_entries(entry)
+        state_key = fes[0]["path"]
+        sequence  = _slot_sequence(fes, extensions)
+        if not sequence:
+            print(f"No video files in this slot's folder(s): "
+                  f"{', '.join(fe['path'] for fe in fes)}")
+            sys.exit(1)
+
+        entry_state = load_state().get(state_key, {})
+        if isinstance(entry_state, str):
+            entry_state = {"folder_index": 0, "last_played": entry_state}
+        folder_index = entry_state.get("folder_index", 0) % len(fes)
+        last_played  = entry_state.get("last_played")
+        offset       = float(entry_state.get("resume_offset", 0.0))
+
+        cursor = _state_to_cursor(sequence, folder_index, last_played)
+        target = max(0, min(len(sequence), cursor + delta))
+        if target != cursor + delta:
+            edge = "the end" if delta > 0 else "the start"
+            print(f"Clamped at {edge}: this slot holds {len(sequence)} episode(s).")
+        if target == cursor:
+            print("Nothing to do — the slot is already there.")
+            return
+
+        new_index, new_last = _cursor_to_state(sequence, target)
+        new_offset = offset if args.keep_offset else 0.0
+
+        def _where(pos, off):
+            at = sequence[pos][1].name if pos < len(sequence) else "(exhausted — will roll over)"
+            return f"{at}  @{off:.1f}s"
+
+        print(f"Slot {entry['time']}  →  {state_key}")
+        print(f"  before:  {_where(cursor, offset)}")
+        print(f"  after:   {_where(target, new_offset)}   ({target - cursor:+d} episode(s))")
+        if offset > 0 and not args.keep_offset:
+            print(f"  resume_offset reset {offset:.1f}s → 0.0s "
+                  f"(pass --keep-offset to hold the slot's alignment)")
+
+        if _dry_run:
+            print("[DRY RUN] State not written.")
+            return
+
+        with state_transaction() as st:
+            _apply_manual_advance(st, state_key, new_index, new_last,
+                                  None if args.keep_offset else 0.0)
+        print("State updated.")
+
+        # Show the real selection rather than asserting it: this runs the same
+        # selector the scheduler will run at the slot's next firing.
+        fresh = load_state()
+        ws    = _window_seconds(entry)
+        if ws is not None:
+            videos, _, _, off_in, _ = get_next_videos_for_window(fes, fresh, extensions, ws)
+        else:
+            videos, _, _ = get_next_videos(fes, fresh, extensions)
+            off_in = 0.0
+        print(f"Next session at {entry['time']} would play "
+              f"(first seeked to {off_in:.1f}s):")
+        for v in videos:
+            print(f"  {v.name}")
         return
 
     # --play-file: play one specific file immediately and exit

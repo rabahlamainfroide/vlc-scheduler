@@ -277,6 +277,100 @@ def test_two_processes_do_not_lose_updates():
         assert state["B"]["n"] == rounds, f"lost updates in the child: {state}"
 
 
+# ── Shifting a slot's position ────────────────────────────────────────────────
+
+def _shift_fixture(vs, tmp, counts=(3, 2)):
+    """A slot of len(counts) folders holding counts[i] episodes each."""
+    folders = []
+    for n, count in enumerate(counts):
+        folder = tmp / f"f{n}"
+        folder.mkdir()
+        for i in range(1, count + 1):
+            (folder / f"{i}.mp4").write_bytes(b"")
+        folders.append({"path": str(folder), "count": 1})
+    return folders, vs._slot_sequence(folders, [".mp4"])
+
+
+def test_cursor_round_trips_through_state():
+    """Every position must survive a conversion to state fields and back."""
+    with sandbox() as (vs, tmp):
+        folders, seq = _shift_fixture(vs, tmp)
+        assert len(seq) == 5, seq
+        for cursor in range(len(seq) + 1):
+            folder_index, last_played = vs._cursor_to_state(seq, cursor)
+            back = vs._state_to_cursor(seq, folder_index, last_played)
+            assert back == cursor, (
+                f"cursor {cursor} -> (folder_index={folder_index}, "
+                f"last_played={last_played!r}) -> {back}"
+            )
+
+
+def test_shift_backward_crosses_into_the_previous_folder():
+    """Stepping off the front of a folder lands on the tail of the one before."""
+    with sandbox() as (vs, tmp):
+        folders, seq = _shift_fixture(vs, tmp)
+        boundary = next(i for i, (fi, _v) in enumerate(seq) if fi == 1)
+
+        # sitting on the first episode of folder 1 ...
+        folder_index, last_played = vs._cursor_to_state(seq, boundary)
+        assert (folder_index, last_played) == (1, None)
+
+        # ... one step back is the last episode of folder 0.
+        folder_index, last_played = vs._cursor_to_state(seq, boundary - 1)
+        assert folder_index == 0, f"folder_index did not follow: {folder_index}"
+        assert last_played == "2.mp4", last_played
+        assert seq[boundary - 1][1].name == "3.mp4"
+
+
+def test_shift_past_the_end_leaves_the_slot_exhausted():
+    """A cursor past the last episode must read back as 'folder exhausted'."""
+    with sandbox() as (vs, tmp):
+        folders, seq = _shift_fixture(vs, tmp)
+        folder_index, last_played = vs._cursor_to_state(seq, len(seq))
+        assert (folder_index, last_played) == (1, "2.mp4"), (folder_index, last_played)
+        # which is exactly what makes the selector roll over to the first folder
+        state = {folders[0]["path"]: {"folder_index": folder_index,
+                                      "last_played": last_played}}
+        videos, new_index, _path = vs.get_next_videos(folders, state, [".mp4"])
+        assert new_index == 0 and videos[0].name == "1.mp4", (new_index, videos)
+
+
+def test_shift_tolerates_a_deleted_last_played():
+    """A last_played that is no longer on disk falls back to its folder's start."""
+    with sandbox() as (vs, tmp):
+        folders, seq = _shift_fixture(vs, tmp)
+        cursor = vs._state_to_cursor(seq, 1, "gone-from-disk.mp4")
+        assert cursor == next(i for i, (fi, _v) in enumerate(seq) if fi == 1)
+
+
+def test_find_schedule_redirects_a_mirror_to_its_primary():
+    with sandbox() as (vs, _tmp):
+        config = {"schedules": [
+            {"time": "15:00", "end_time": "16:00", "folders": [{"path": "/v/fa"}]},
+            {"time": "08:00", "end_time": "09:00", "mirror": "15:00"},
+        ]}
+        primary, mirror = vs._find_schedule(config, "08:00")
+        assert primary["time"] == "15:00", primary
+        assert mirror["time"] == "08:00", mirror
+
+        primary, mirror = vs._find_schedule(config, "15:00")
+        assert primary["time"] == "15:00" and mirror is None
+
+        # addressable by folder path too
+        primary, mirror = vs._find_schedule(config, "/v/fa")
+        assert primary["time"] == "15:00" and mirror is None
+
+        assert vs._find_schedule(config, "03:00") == (None, None)
+
+
+def test_window_seconds():
+    with sandbox() as (vs, _tmp):
+        assert vs._window_seconds({"time": "13:00", "end_time": "15:00"}) == 7200.0
+        assert vs._window_seconds({"time": "13:00"}) is None
+        # an end_time before the start is not a window
+        assert vs._window_seconds({"time": "15:00", "end_time": "13:00"}) is None
+
+
 def main() -> int:
     tests = [fn for name, fn in globals().items()
              if name.startswith("test_") and callable(fn)]
