@@ -1108,17 +1108,24 @@ def startup_catchup(config: dict, vlc_path: str, extensions: list) -> None:
         candidates.append((scheduled_dt, entry))
 
     for scheduled_dt, entry in sorted(candidates, key=lambda x: x[0], reverse=True):
+        # Only resume a slot that is still on air.  Without this, a cut that
+        # killed the 21:00 slot at 22:00 had the machine start playing it at
+        # 05:00 the next morning, hours after the slot ended.  A slot whose
+        # window has closed is skipped so an older, still-open one can be
+        # considered instead.  Count-based slots carry no end_time and so no
+        # window; those keep the old unconditional behaviour.
+        window = _window_seconds(entry)
+        if window is not None and now >= scheduled_dt + datetime.timedelta(seconds=window):
+            continue
+
         if "mirror" in entry:
             # A mirror records no state, so there is nothing to call missed or
             # interrupted -- which used to mean a power cut during a morning
             # mirror left the screen dark until the next primary hours later.
             # Its window still being open is reason enough to play it, and
             # replaying one is harmless because it rotates nothing.
-            window = _window_seconds(entry)
             if window is None:
                 continue
-            if now >= scheduled_dt + datetime.timedelta(seconds=window):
-                continue  # the window has closed; fall through to older slots
             primary, _ = _find_schedule(config, entry["time"])
             if primary is None:
                 log.error(f"Startup catch-up: mirror {entry['time']} points at "

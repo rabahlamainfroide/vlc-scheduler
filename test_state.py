@@ -522,6 +522,65 @@ def test_catchup_ignores_a_mirror_whose_window_has_closed():
         assert not played, "a closed mirror window must not trigger playback"
 
 
+def _interrupted_primary(vs, tmp, now, started_h_ago, window_h, end_time=True):
+    """A primary that started `started_h_ago` hours ago and was cut off."""
+    import datetime
+    started = (now - datetime.timedelta(hours=started_h_ago)).replace(second=0, microsecond=0)
+    folder = tmp / "series"
+    if not folder.exists():
+        folder.mkdir()
+        for i in range(1, 4):
+            (folder / f"{i}.mp4").write_bytes(b"")
+    slot = {"time": started.strftime("%H:%M"), "folders": [{"path": str(folder)}]}
+    if end_time:
+        slot["end_time"] = (started + datetime.timedelta(hours=window_h)).strftime("%H:%M")
+    vs.save_state({str(folder): {
+        "folder_index": 0, "last_played": "1.mp4", "resume_offset": 0.0,
+        "last_session_at": started.isoformat(), "session_completed": False,
+        "last_session_folder": str(folder), "last_session_videos": ["2.mp4"],
+        "last_session_resume_offset": 0.0,
+        "pending_folder_index": 0, "pending_last_played": "2.mp4",
+    }})
+    return {"video_extensions": [".mp4"], "schedules": [slot]}
+
+
+def test_catchup_resumes_an_interrupted_primary_inside_its_window():
+    import datetime
+    with sandbox() as (vs, tmp):
+        now = datetime.datetime.now()
+        config = _interrupted_primary(vs, tmp, now, started_h_ago=1, window_h=2)
+        played = []
+        vs.play_videos = lambda *a, **k: played.append(a)
+        vs.startup_catchup(config, "/bin/true", [".mp4"])
+        assert played, "a slot still on air must be resumed"
+
+
+def test_catchup_ignores_an_interrupted_primary_past_its_window():
+    """The 21:00 slot cut at 22:00 must not start playing at 05:00."""
+    import datetime
+    with sandbox() as (vs, tmp):
+        now = datetime.datetime.now()
+        # started 8h ago with a 2h window: closed 6h back
+        config = _interrupted_primary(vs, tmp, now, started_h_ago=8, window_h=2)
+        played = []
+        vs.play_videos = lambda *a, **k: played.append(a)
+        vs.startup_catchup(config, "/bin/true", [".mp4"])
+        assert not played, "a slot whose window closed must not be replayed late"
+
+
+def test_catchup_still_resumes_a_count_based_slot_with_no_window():
+    """Slots without end_time have no window, so they keep the old behaviour."""
+    import datetime
+    with sandbox() as (vs, tmp):
+        now = datetime.datetime.now()
+        config = _interrupted_primary(vs, tmp, now, started_h_ago=8, window_h=2,
+                                      end_time=False)
+        played = []
+        vs.play_videos = lambda *a, **k: played.append(a)
+        vs.startup_catchup(config, "/bin/true", [".mp4"])
+        assert played, "a count-based slot has no window to fall outside of"
+
+
 def main() -> int:
     tests = [fn for name, fn in globals().items()
              if name.startswith("test_") and callable(fn)]
