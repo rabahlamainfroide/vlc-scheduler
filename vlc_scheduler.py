@@ -872,30 +872,54 @@ def play_videos(folder_entries: list, vlc_path: str, extensions: list,
 
 # ── Status HTTP endpoint ──────────────────────────────────────────────────────
 
+def _schedule_status(entry: dict, config: dict, state: dict) -> dict:
+    """Build one row of the status payload.
+
+    A mirror slot owns no folders and no state of its own -- it replays what
+    the primary it points at played -- so its row reports that primary's
+    position, tagged with `mirrors`.  Without the redirect, get_folder_entries()
+    falls through to entry.get("folder", "") and the row comes back with an
+    empty active_folder and a null last_played.
+    """
+    source = entry
+    if "mirror" in entry:
+        primary, _ = _find_schedule(config, entry["time"])
+        if primary is None:
+            return {
+                "time":    entry["time"],
+                "mirrors": entry["mirror"],
+                "error":   f"mirror target {entry['mirror']!r} not found",
+            }
+        source = primary
+
+    fes         = get_folder_entries(source)
+    state_key   = fes[0]["path"]
+    entry_state = state.get(state_key, {})
+    if isinstance(entry_state, str):
+        entry_state = {"folder_index": 0, "last_played": entry_state}
+    folder_index = entry_state.get("folder_index", 0) % len(fes)
+
+    result = {
+        "time":          entry["time"],
+        "folders":       fes,
+        "active_folder": fes[folder_index]["path"],
+        "last_played":   entry_state.get("last_played"),
+    }
+    if source is not entry:
+        result["mirrors"] = source["time"]
+    if entry.get("end_time"):
+        result["end_time"]      = entry["end_time"]
+        result["resume_offset"] = entry_state.get("resume_offset", 0.0)
+    return result
+
+
 class _StatusHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         state   = load_state()
-        def _schedule_status(entry):
-            fes         = get_folder_entries(entry)
-            state_key   = fes[0]["path"]
-            entry_state = state.get(state_key, {})
-            if isinstance(entry_state, str):
-                entry_state = {"folder_index": 0, "last_played": entry_state}
-            folder_index = entry_state.get("folder_index", 0) % len(fes)
-            result = {
-                "time":          entry["time"],
-                "folders":       fes,
-                "active_folder": fes[folder_index]["path"],
-                "last_played":   entry_state.get("last_played"),
-            }
-            if entry.get("end_time"):
-                result["end_time"]      = entry["end_time"]
-                result["resume_offset"] = entry_state.get("resume_offset", 0.0)
-            return result
-
         payload = {
             "vlc_running": _active_proc is not None and _active_proc.poll() is None,
-            "schedules":   [_schedule_status(e) for e in _current_config.get("schedules", [])],
+            "schedules":   [_schedule_status(e, _current_config, state)
+                            for e in _current_config.get("schedules", [])],
         }
         body = json.dumps(payload, indent=2).encode()
         self.send_response(200)

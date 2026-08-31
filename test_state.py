@@ -371,6 +371,57 @@ def test_window_seconds():
         assert vs._window_seconds({"time": "15:00", "end_time": "13:00"}) is None
 
 
+# ── Status endpoint ───────────────────────────────────────────────────────────
+
+def _status_config():
+    return {"schedules": [
+        {"time": "15:00", "end_time": "16:00", "folders": [{"path": "/v/fa"}]},
+        {"time": "08:00", "end_time": "09:00", "mirror": "15:00"},
+        {"time": "07:00", "mirror": "99:99"},
+    ]}
+
+
+def test_status_row_for_a_mirror_reports_its_primary():
+    """A mirror row used to come back with an empty folder and a null episode."""
+    with sandbox() as (vs, _tmp):
+        config = _status_config()
+        state = {"/v/fa": {"folder_index": 0, "last_played": "EP27.mkv",
+                           "resume_offset": 1981.8}}
+        row = vs._schedule_status(config["schedules"][1], config, state)
+
+        assert row["active_folder"] == "/v/fa", row
+        assert row["last_played"] == "EP27.mkv", row
+        assert row["resume_offset"] == 1981.8, row
+        assert row["mirrors"] == "15:00", row
+        # the row keeps its own clock, not the primary's
+        assert row["time"] == "08:00" and row["end_time"] == "09:00", row
+
+
+def test_status_row_for_a_primary_is_unchanged():
+    with sandbox() as (vs, _tmp):
+        config = _status_config()
+        state = {"/v/fa": {"folder_index": 0, "last_played": "EP27.mkv"}}
+        row = vs._schedule_status(config["schedules"][0], config, state)
+        assert row["active_folder"] == "/v/fa" and row["time"] == "15:00", row
+        assert "mirrors" not in row, "a primary must not be labelled a mirror"
+
+
+def test_status_row_survives_a_dangling_mirror_target():
+    """A misconfigured mirror must not take the whole endpoint down."""
+    with sandbox() as (vs, _tmp):
+        config = _status_config()
+        row = vs._schedule_status(config["schedules"][2], config, {})
+        assert row["time"] == "07:00" and "error" in row, row
+
+
+def test_status_payload_covers_every_schedule():
+    with sandbox() as (vs, _tmp):
+        config = _status_config()
+        rows = [vs._schedule_status(e, config, {}) for e in config["schedules"]]
+        assert len(rows) == 3
+        assert [r["time"] for r in rows] == ["15:00", "08:00", "07:00"]
+
+
 def main() -> int:
     tests = [fn for name, fn in globals().items()
              if name.startswith("test_") and callable(fn)]

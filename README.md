@@ -668,12 +668,23 @@ curl http://127.0.0.1:8765/
       ],
       "active_folder": "/home/user/videos/series_B",
       "last_played": "003_title.mp4"
+    },
+    {
+      "time": "08:00",
+      "end_time": "09:00",
+      "mirrors": "13:00",
+      "folders": [{"path": "/home/user/videos/series_A", "count": 1}],
+      "active_folder": "/home/user/videos/series_A",
+      "last_played": "007_title.mp4",
+      "resume_offset": 87.3
     }
   ]
 }
 ```
 
 `resume_offset` (seconds) only appears for time-window schedules and shows how far into the first episode of the next session VLC will seek.
+
+A mirror slot holds no folders or state of its own, so its row reports the position of the primary it replays and names that primary in `mirrors`. The `time` and `end_time` stay the mirror's own.
 
 ---
 
