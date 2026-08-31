@@ -75,6 +75,25 @@ def _wait_for_confirmation(vs, key, timeout=10.0):
     raise AssertionError(f"{key} was never confirmed: {vs.load_state().get(key)}")
 
 
+def _wait_for(pred, timeout=10.0, what="condition"):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if pred():
+            return
+        time.sleep(0.02)
+    raise AssertionError(f"{what} never happened")
+
+
+def _run(vs, *, deadline_in=3600.0, attempt=0, content=7200.0, is_mirror=False):
+    """A _SlotRun for a slot that is still well inside its window."""
+    return vs._SlotRun(
+        [{"path": "A", "count": 1}], "/bin/true", [".mp4"], None,
+        is_mirror,
+        None if deadline_in is None else time.monotonic() + deadline_in,
+        attempt, vs._kill_generation, content,
+    )
+
+
 class _Proc:
     """Stand-in for a VLC process that exits when released."""
 
@@ -579,6 +598,374 @@ def test_catchup_still_resumes_a_count_based_slot_with_no_window():
         vs.play_videos = lambda *a, **k: played.append(a)
         vs.startup_catchup(config, "/bin/true", [".mp4"])
         assert played, "a count-based slot has no window to fall outside of"
+
+
+# ── Dead air: VLC going away mid-window ───────────────────────────────────────
+
+def test_crash_mid_window_restarts_the_slot_without_advancing():
+    """VLC dying with an hour of window left must not leave a black screen.
+
+    The rotation stays uncommitted so the restart replays the same batch:
+    nobody watched those episodes, so nobody should skip past them either.
+    """
+    with sandbox() as (vs, _tmp):
+        vs.RELAUNCH_BACKOFF_SECONDS = 0.0
+        vs._vlc_is_running = lambda: False   # the screen is black
+        relaunched = []
+        vs.play_videos = lambda *a, **k: relaunched.append((a, k))
+
+        vs.save_state({"A": _session()})
+        vs._on_vlc_exit(_Proc(), "A", "T-A", time.monotonic() - 600, _run(vs))
+
+        _wait_for(lambda: relaunched, what="the slot restart")
+        _args, kwargs = relaunched[0]
+        assert kwargs["_attempt"] == 1, kwargs
+        a = vs.load_state()["A"]
+        assert a["last_played"] == "ep01", f"a crashed session advanced anyway: {a}"
+        assert "pending_last_played" in a, a
+
+
+def test_restart_reselects_the_same_batch_it_lost():
+    """End to end: the batch a crash interrupted is the batch that comes back."""
+    with sandbox() as (vs, tmp):
+        vs.RELAUNCH_BACKOFF_SECONDS = 0.0
+        vs._vlc_is_running = lambda: False   # the screen is black
+        vs.ABNORMAL_EXIT_SECONDS = 0.0
+        vs.kill_vlc = lambda: None
+        vs.get_video_duration = lambda path: 1000.0
+
+        folder = tmp / "A"
+        folder.mkdir()
+        for name in ("1.mp4", "2.mp4", "3.mp4", "4.mp4"):
+            (folder / name).write_bytes(b"")
+
+        launches = []
+        real_popen = vs.subprocess.Popen
+
+        class _Dead:
+            """A VLC that is already gone by the time we look at it."""
+            pid = 4242
+            def poll(self): return 0
+            def wait(self): return 0
+            def terminate(self): pass
+
+        def fake_popen(argv, **kw):
+            launches.append([a for a in argv if a.endswith(".mp4")])
+            return _Dead()
+
+        vs.subprocess.Popen = fake_popen
+        try:
+            # Content window and on-air window are the same thing for a primary
+            # slot; the restart is then sized to what is left of it.
+            vs.play_videos([{"path": str(folder), "count": 1}], "/bin/true",
+                           [".mp4"], None, 1500.0, on_air_seconds=1500.0)
+            _wait_for(lambda: len(launches) >= 2, what="the restart launch")
+            vs._kill_generation += 1      # stop the chain before the sandbox goes
+            time.sleep(0.1)
+        finally:
+            vs.subprocess.Popen = real_popen
+
+        first  = [Path(v).name for v in launches[0]]
+        second = [Path(v).name for v in launches[1]]
+        assert first == ["1.mp4", "2.mp4"], first
+        assert second == first, f"restart skipped past unwatched episodes: {second}"
+
+
+def test_a_deliberate_kill_never_restarts_the_slot():
+    """The next slot taking the screen must not be fought over."""
+    with sandbox() as (vs, _tmp):
+        vs.RELAUNCH_BACKOFF_SECONDS = 0.0
+        vs._vlc_is_running = lambda: False   # the screen is black
+        relaunched = []
+        vs.play_videos = lambda *a, **k: relaunched.append(a)
+
+        vs.save_state({"A": _session()})
+        run = _run(vs)
+        vs._kill_generation += 1          # what kill_vlc() does on hand-over
+
+        vs._on_vlc_exit(_Proc(), "A", "T-A", time.monotonic() - 600, run)
+
+        time.sleep(0.2)
+        assert not relaunched, "restarted a slot that was deliberately stopped"
+        a = vs.load_state()["A"]
+        assert a["session_completed"] is True, f"hand-over lost the rotation: {a}"
+        assert a["last_played"] == "ep02", a
+
+
+def test_restarts_stop_at_the_attempt_budget():
+    """A file VLC cannot decode must not spin the screen for the whole window."""
+    with sandbox() as (vs, _tmp):
+        vs.RELAUNCH_BACKOFF_SECONDS = 0.0
+        vs._vlc_is_running = lambda: False   # the screen is black
+        relaunched = []
+        vs.play_videos = lambda *a, **k: relaunched.append(a)
+
+        vs.save_state({"A": _session()})
+        vs._on_vlc_exit(_Proc(), "A", "T-A", time.monotonic() - 600,
+                        _run(vs, attempt=vs.RELAUNCH_MAX_ATTEMPTS))
+
+        time.sleep(0.2)
+        assert not relaunched, "kept restarting past the attempt budget"
+
+
+def test_no_restart_once_the_window_is_nearly_over():
+    with sandbox() as (vs, _tmp):
+        vs.RELAUNCH_BACKOFF_SECONDS = 0.0
+        vs._vlc_is_running = lambda: False   # the screen is black
+        relaunched = []
+        vs.play_videos = lambda *a, **k: relaunched.append(a)
+
+        vs.save_state({"A": _session()})
+        vs._on_vlc_exit(_Proc(), "A", "T-A", time.monotonic() - 600,
+                        _run(vs, deadline_in=30.0))
+
+        time.sleep(0.2)
+        assert not relaunched, "restarted a slot with 30s of window left"
+        assert vs.load_state()["A"]["session_completed"] is True
+
+
+def test_a_slot_with_no_end_time_is_not_supervised():
+    """No window means no knowable end, so there is nothing to fill."""
+    with sandbox() as (vs, _tmp):
+        vs.RELAUNCH_BACKOFF_SECONDS = 0.0
+        vs._vlc_is_running = lambda: False   # the screen is black
+        relaunched = []
+        vs.play_videos = lambda *a, **k: relaunched.append(a)
+
+        vs.save_state({"A": _session()})
+        vs._on_vlc_exit(_Proc(), "A", "T-A", time.monotonic() - 600,
+                        _run(vs, deadline_in=None, content=None))
+
+        time.sleep(0.2)
+        assert not relaunched, "supervised a slot that has no window"
+        assert vs.load_state()["A"]["session_completed"] is True
+
+
+def test_a_playlist_that_ran_out_early_rotates_before_restarting():
+    """Finishing the batch is not dying: commit first, then play the NEXT one."""
+    with sandbox() as (vs, _tmp):
+        vs.RELAUNCH_BACKOFF_SECONDS = 0.0
+        vs._vlc_is_running = lambda: False   # the screen is black
+        relaunched = []
+        vs.play_videos = lambda *a, **k: relaunched.append(a)
+
+        vs.save_state({"A": _session()})
+        # 10 min of content, played for 10 min, inside an hour-long window.
+        vs._on_vlc_exit(_Proc(), "A", "T-A", time.monotonic() - 600,
+                        _run(vs, content=600.0))
+
+        _wait_for(lambda: relaunched, what="the follow-on batch")
+        a = vs.load_state()["A"]
+        assert a["session_completed"] is True, f"a full playback did not commit: {a}"
+        assert a["last_played"] == "ep02", a
+
+
+def test_a_restart_never_interrupts_manual_playback():
+    """`--play-now` runs in another process, so its pkill looks like a crash.
+
+    What tells them apart is the screen: if VLC is playing, there is no dead
+    air to fix and the operator is not to be walked over.
+    """
+    with sandbox() as (vs, _tmp):
+        vs.RELAUNCH_BACKOFF_SECONDS = 0.0
+        vs._vlc_is_running = lambda: True     # somebody started an episode by hand
+        relaunched = []
+        vs.play_videos = lambda *a, **k: relaunched.append(a)
+
+        vs.save_state({"A": _session()})
+        vs._on_vlc_exit(_Proc(), "A", "T-A", time.monotonic() - 600, _run(vs))
+
+        time.sleep(0.2)
+        assert not relaunched, "a restart stomped on manual playback"
+        assert vs.load_state()["A"]["session_completed"] is True
+
+
+def test_a_restart_is_cancelled_if_playback_returns_during_the_backoff():
+    """The pause before a restart is exactly when an operator reaches for the
+    remote, so the screen is checked again on the way out, not just on the
+    way in."""
+    with sandbox() as (vs, _tmp):
+        vs.RELAUNCH_BACKOFF_SECONDS = 0.0
+        checks = []
+
+        def screen():
+            checks.append(len(checks))
+            return len(checks) > 1        # black at first, playing a moment later
+
+        vs._vlc_is_running = screen
+        relaunched = []
+        vs.play_videos = lambda *a, **k: relaunched.append(a)
+
+        vs.save_state({"A": _session()})
+        vs._on_vlc_exit(_Proc(), "A", "T-A", time.monotonic() - 600, _run(vs))
+
+        _wait_for(lambda: len(checks) >= 2, what="the second screen check")
+        time.sleep(0.2)
+        assert not relaunched, "restarted over playback that came back first"
+
+
+def test_a_restart_is_cancelled_if_another_slot_starts_during_the_backoff():
+    with sandbox() as (vs, _tmp):
+        vs.RELAUNCH_BACKOFF_SECONDS = 0.3
+        vs._vlc_is_running = lambda: False
+        relaunched = []
+        vs.play_videos = lambda *a, **k: relaunched.append(a)
+
+        vs.save_state({"A": _session()})
+        vs._on_vlc_exit(_Proc(), "A", "T-A", time.monotonic() - 600, _run(vs))
+        vs._kill_generation += 1          # the next slot fires mid-backoff
+
+        time.sleep(0.6)
+        assert not relaunched, "restarted after another slot had taken over"
+
+
+def test_a_restart_is_cancelled_if_the_window_closes_during_the_backoff():
+    """Near the end of a window the pause can outlast the slot itself, and a
+    slot that no longer owns the screen must not grab it back."""
+    with sandbox() as (vs, _tmp):
+        vs.RELAUNCH_MIN_REMAINING_SECONDS = 0.5
+        vs.RELAUNCH_BACKOFF_SECONDS = 0.8
+        vs._vlc_is_running = lambda: False
+        relaunched = []
+        vs.play_videos = lambda *a, **k: relaunched.append(a)
+
+        vs.save_state({"A": _session()})
+        vs._on_vlc_exit(_Proc(), "A", "T-A", time.monotonic() - 600,
+                        _run(vs, deadline_in=1.0))
+
+        time.sleep(1.2)
+        assert not relaunched, "restarted a slot whose window closed while waiting"
+
+
+def test_a_slot_that_never_launched_takes_the_screen_anyway():
+    """The retry for an unreadable folder is a launch, not a recovery: the
+    previous slot's VLC is still playing by design, and must not block it."""
+    with sandbox() as (vs, tmp):
+        vs.RETRY_NO_VIDEO_SECONDS = 0.0
+        vs._vlc_is_running = lambda: True     # the previous slot is still up
+        empty = tmp / "empty"
+        empty.mkdir()
+
+        real = vs.play_videos
+        attempts = []
+
+        def counting(*a, **k):
+            attempts.append(k.get("_attempt", 0))
+            return real(*a, **k)
+
+        vs.play_videos = counting
+        counting([{"path": str(empty), "count": 1}], "/bin/true", [".mp4"],
+                 None, 3600.0, on_air_seconds=3600.0)
+
+        _wait_for(lambda: len(attempts) > vs.RELAUNCH_MAX_ATTEMPTS,
+                  what="the retries")
+
+
+# ── Dead air: nothing playable at slot time ───────────────────────────────────
+
+def test_an_unreadable_folder_is_retried_inside_the_window():
+    """A share that has not mounted yet must not cost the whole slot."""
+    with sandbox() as (vs, tmp):
+        vs.RETRY_NO_VIDEO_SECONDS = 0.0
+        vs.RELAUNCH_BACKOFF_SECONDS = 0.0
+        vs._vlc_is_running = lambda: False   # the screen is black
+        empty = tmp / "empty"
+        empty.mkdir()
+
+        real = vs.play_videos
+        attempts = []
+
+        def counting(*a, **k):
+            attempts.append(k.get("_attempt", 0))
+            return real(*a, **k)
+
+        vs.play_videos = counting
+        counting([{"path": str(empty), "count": 1}], "/bin/true", [".mp4"],
+                 None, 3600.0, on_air_seconds=3600.0)
+
+        _wait_for(lambda: len(attempts) > vs.RELAUNCH_MAX_ATTEMPTS,
+                  what="the retries")
+        time.sleep(0.2)
+        assert sorted(attempts) == [0, 1, 2, 3], attempts
+        assert vs.load_state() == {}, "an empty slot wrote state"
+
+
+# ── ffprobe failures ──────────────────────────────────────────────────────────
+
+def test_an_unprobeable_episode_cannot_swallow_the_folder():
+    """A file that will not probe used to look free, so the window took the lot.
+
+    One good episode then nineteen that fail: charged 0s each they all fit in
+    the window, last_played lands on the final file, and the next session wraps
+    back to episode 1 -- a whole series burned in one slot.
+    """
+    with sandbox() as (vs, tmp):
+        folder = tmp / "A"
+        folder.mkdir()
+        for i in range(1, 21):
+            (folder / f"{i:02d}.mp4").write_bytes(b"")
+
+        vs.get_video_duration = lambda path: 1000.0 if path.name == "01.mp4" else 0.0
+
+        videos, _idx, _path, _in, _out = vs.get_next_videos_for_window(
+            [{"path": str(folder), "count": 1}], {}, [".mp4"], 3000.0
+        )
+        names = [v.name for v in videos]
+        assert names == ["01.mp4", "02.mp4", "03.mp4"], names
+
+
+def test_an_unprobeable_episode_is_charged_the_batch_median():
+    with sandbox() as (vs, tmp):
+        folder = tmp / "A"
+        folder.mkdir()
+        for i in range(1, 11):
+            (folder / f"{i:02d}.mp4").write_bytes(b"")
+
+        # 600, 600, then a failure charged the median (600) -- three fill 1800.
+        durations = {"01.mp4": 600.0, "02.mp4": 600.0}
+        vs.get_video_duration = lambda path: durations.get(path.name, 0.0)
+
+        videos, _idx, _path, _in, out = vs.get_next_videos_for_window(
+            [{"path": str(folder), "count": 1}], {}, [".mp4"], 1800.0
+        )
+        assert [v.name for v in videos] == ["01.mp4", "02.mp4", "03.mp4"], videos
+        assert out == 0.0, out
+
+
+def test_a_folder_where_nothing_probes_selects_nothing():
+    """Unreadable is not the same as short: play nothing, rotate nothing."""
+    with sandbox() as (vs, tmp):
+        folder = tmp / "A"
+        folder.mkdir()
+        for i in range(1, 6):
+            (folder / f"{i:02d}.mp4").write_bytes(b"")
+
+        vs.get_video_duration = lambda path: 0.0
+
+        videos, _idx, _path, _in, _out = vs.get_next_videos_for_window(
+            [{"path": str(folder), "count": 1}], {}, [".mp4"], 3000.0
+        )
+        assert videos == [], [v.name for v in videos]
+
+
+def test_an_unreadable_folder_leaves_the_rotation_alone():
+    """The end-to-end shape of the above: no launch, no state, no rotation."""
+    with sandbox() as (vs, tmp):
+        vs.RETRY_NO_VIDEO_SECONDS = 0.0
+        vs.kill_vlc = lambda: None
+        vs.get_video_duration = lambda path: 0.0
+
+        folder = tmp / "A"
+        folder.mkdir()
+        for i in range(1, 6):
+            (folder / f"{i:02d}.mp4").write_bytes(b"")
+
+        before = {str(folder): _session()}
+        vs.save_state(dict(before))
+        vs.play_videos([{"path": str(folder), "count": 1}], "/bin/true",
+                       [".mp4"], None, 3000.0)
+
+        assert vs.load_state() == before, vs.load_state()
 
 
 def main() -> int:

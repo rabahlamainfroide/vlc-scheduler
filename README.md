@@ -14,6 +14,7 @@ Automatically plays the next numbered video(s) from designated folders at schedu
 - **Auto VLC Detection**: Finds VLC automatically — no path configuration needed
 - **Stale VLC Cleanup**: Kills any leftover VLC instance before starting a new one
 - **Pre-play Hooks**: Run a shell command before each playback (e.g. reset screensaver, set volume)
+- **Screen watchdog**: If VLC dies while a slot still owns the screen, the slot restarts and plays out the rest of its window instead of leaving a black screen until the next slot. Manual playback is never interrupted
 - **Startup Catch-up**: If the machine reboots mid-playback or while a scheduled slot was missed, the scheduler immediately plays that slot on startup instead of waiting for the next one
 - **Config Hot-reload**: Edit `config.json` while running — changes take effect within 30 s
 - **Status Endpoint**: Live JSON status at `http://127.0.0.1:8765/`
@@ -500,6 +501,41 @@ A mirror slot plays the exact same episodes as its primary slot, with the same s
 **If the primary fires first:** the primary saves a `last_session` snapshot (folder, filenames, `resume_offset` used). When the mirror fires later, it reads that snapshot and replays identically.
 
 **If the mirror fires first:** no snapshot exists yet, so the mirror computes the same selection the primary would (same state, same window) and plays it without writing anything to state. The primary then fires normally and advances the queue.
+
+### How the screen watchdog works
+
+A slot with an `end_time` owns the screen until that time. If VLC goes away
+before then — a decoder crash, a display glitch, or a playlist that ran out
+early — the slot is restarted after a 15 s pause and given whatever is left of
+its window. Up to 3 restarts per slot, so an episode VLC cannot decode cannot
+spin the screen all afternoon.
+
+What happens to the rotation depends on why VLC stopped:
+
+| VLC stopped because | Rotation | Restart plays |
+|---|---|---|
+| It crashed part-way through the batch | Not advanced | The same episodes again — nobody watched them |
+| It finished everything it was given | Advanced | The next batch |
+| The next slot took over | Advanced | Nothing — that slot owns the screen now |
+| You started something by hand | Advanced | Nothing — see below |
+
+A restart is only ever attempted when the screen is actually empty: before
+relaunching, the watchdog checks whether any VLC is running. Playing episodes
+by hand (`--play-now`, or launching VLC yourself) therefore stops the watchdog
+from interfering, since it can see something is already on screen.
+
+Slots without an `end_time` have no knowable end, so they are not supervised.
+
+### When a folder cannot be read
+
+Durations come from `ffprobe`. An episode it cannot read is charged the median
+duration of the others in the same batch rather than 0 s — a free episode would
+let the window selector keep taking files until the folder ran out, burning a
+whole series in one session.
+
+If *nothing* in the folder probes — an external drive that has not mounted yet,
+typically — the slot plays nothing rather than advancing the rotation past
+episodes nobody could watch, and retries every minute inside its window.
 
 Changes to `config.json` are picked up automatically within 30 seconds — no restart needed.
 

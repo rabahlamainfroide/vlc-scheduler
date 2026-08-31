@@ -20,7 +20,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
 
 try:
     import schedule
@@ -42,6 +42,30 @@ LOG_FILE        = BASE_DIR / "vlc_scheduler.log"
 # moments after launch.  Such a session does not confirm a rotation.
 ABNORMAL_EXIT_SECONDS = 60.0
 
+# A slot that loses VLC while its window is still open leaves a black screen
+# until the next slot fires -- up to two hours on this schedule, unattended.
+# The remaining window is replayed instead, at most RELAUNCH_MAX_ATTEMPTS times
+# so an episode VLC cannot decode cannot spin the screen forever.
+RELAUNCH_MIN_REMAINING_SECONDS = 120.0
+RELAUNCH_MAX_ATTEMPTS          = 3
+RELAUNCH_BACKOFF_SECONDS       = 15.0
+
+# How close to the end of its own content VLC has to get before the exit counts
+# as "played everything I gave it" rather than "died".  The distinction decides
+# whether the slot replays the batch or rotates on to the next one.
+COMPLETION_SLACK_SECONDS       = 60.0
+
+# A slot whose folder is momentarily unreadable (a share that has not mounted
+# yet) selects nothing.  Rather than lose the slot for the whole day it is
+# retried inside its window, on the same attempt budget.
+RETRY_NO_VIDEO_SECONDS = 60.0
+
+# ffprobe failures make an episode look free (0 s), which would let the window
+# selector swallow a whole folder in a single session.  An episode that will
+# not probe is charged the median of those already measured in the same batch,
+# or this value when it is the first one.
+FALLBACK_EPISODE_SECONDS = 1800.0
+
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -58,6 +82,10 @@ _active_proc: Optional[subprocess.Popen] = None
 _config_mtime: float = 0.0
 _dry_run: bool = False
 _current_config: dict = {}
+# Bumped by every kill_vlc().  A session whose generation changed while it was
+# playing was ended deliberately -- the next slot taking over, or --play-now --
+# so its watchdog must not fight back by relaunching it.
+_kill_generation: int = 0
 _state_lock = threading.Lock()
 
 # ── Default configuration (written on first run) ──────────────────────────────
@@ -422,6 +450,15 @@ def _cursor_to_state(sequence: list, cursor: int) -> tuple:
     return folder_index, None
 
 
+def _median(values: list) -> float:
+    """Median of a non-empty list of floats."""
+    ordered = sorted(values)
+    mid     = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
 def get_video_duration(path: Path) -> float:
     """Return video duration in seconds via ffprobe, or 0.0 on failure."""
     try:
@@ -593,16 +630,46 @@ def get_next_videos_for_window(
         total          = len(videos)
         selected       = []
         durations      = []
+        measured       = []   # real probe results, for the median estimate
+        estimated      = []   # names charged an estimated duration
         total_duration = 0.0
         for idx in range(next_index, total):
             video = videos[idx]
             dur   = get_video_duration(video)
+            if dur <= 0:
+                # An episode ffprobe cannot read must never be charged 0 s: it
+                # would cost nothing against the window, so the loop would keep
+                # taking files until the folder ran out -- burning a whole
+                # series in one session and wrapping back to episode 1 on the
+                # next.  Charge it what its neighbours cost instead.
+                dur = _median(measured) if measured else FALLBACK_EPISODE_SECONDS
+                estimated.append(video.name)
+            else:
+                measured.append(dur)
             selected.append(video)
             durations.append(dur)
             total_duration += dur
             # Effective content played = total_duration - resume_offset
             if total_duration - resume_offset >= window_seconds:
                 break
+
+        if estimated and not measured:
+            # Not one episode probed.  ffprobe itself works -- config
+            # validation checks for it -- so the folder is unreadable right
+            # now, most likely a share that has not mounted yet.  Playing blind
+            # would advance the rotation past episodes nobody could watch, so
+            # select nothing; the caller retries inside the window.
+            log.error(
+                f"ffprobe failed for every candidate in {folder_path} "
+                f"({len(estimated)} file(s)) — folder unreadable, selecting nothing"
+            )
+            return [], folder_index, folder_path, resume_offset, 0.0
+
+        if estimated:
+            log.warning(
+                f"ffprobe failed for {len(estimated)} episode(s) in {folder_path}"
+                f" — charged an estimated duration: {', '.join(estimated)}"
+            )
 
         new_resume_offset = max(0.0, total_duration - resume_offset - window_seconds)
 
@@ -626,7 +693,12 @@ def get_next_videos_for_window(
 
 def kill_vlc() -> None:
     """Terminate all VLC processes and block until they are gone."""
-    global _active_proc
+    global _active_proc, _kill_generation
+
+    # Every exit caused from here is deliberate.  Watchdogs compare the
+    # generation they launched under against this one to tell "VLC crashed and
+    # the screen is now black" from "the next slot asked VLC to stop".
+    _kill_generation += 1
 
     # Terminate the handle we have (if any)
     if _active_proc is not None:
@@ -692,17 +764,149 @@ def _run_hook(cmd: str) -> None:
         log.exception(f"Hook failed: {cmd!r}")
 
 
+# ── Keeping the screen alive ──────────────────────────────────────────────────
+
+class _SlotRun(NamedTuple):
+    """Everything needed to put a slot back on screen after VLC goes away."""
+    folder_entries:  list
+    vlc_path:        str
+    extensions:      list
+    before_play:     Optional[str]
+    is_mirror:       bool
+    deadline:        Optional[float]  # absolute time.monotonic(); None = unsupervised
+    attempt:         int
+    kill_generation: int
+    # Seconds of video actually handed to VLC.  Lets the watchdog tell an
+    # early death (replay the batch) from a playlist that simply ran out
+    # before the window did (rotate on).  None means "cannot tell".
+    content_seconds: Optional[float] = None
+
+
+def _vlc_is_running() -> bool:
+    """Is any VLC on screen, including one this process did not start?
+
+    _kill_generation only sees kills made from inside this process.  A manual
+    `--play-now`, or VLC started by hand, runs elsewhere and pkills our player
+    without touching the counter -- which looks exactly like a crash.  Asking
+    the system what is on screen is what tells the two apart.
+    """
+    try:
+        return subprocess.run(["pgrep", "vlc"], capture_output=True).returncode == 0
+    except Exception:
+        log.exception("Could not check for running VLC processes")
+        return True          # assume something is playing rather than interrupt it
+
+
+def _retry_slot(run: _SlotRun, delay: float, reason: str,
+                require_dark: bool = True) -> bool:
+    """Put a slot back on screen if it should still own it.  True if scheduled.
+
+    Called when VLC goes away while the window is still open -- it crashed, or
+    it never launched because the folder was unreadable.  Without this the
+    display stays black until the next slot fires, which on this schedule can
+    be two hours away with nobody watching the log.
+
+    Nothing here touches the state file.  The interrupted session left its
+    pending_* fields unpromoted, so the relaunch re-selects the same batch at
+    the same offset and writes its own prediction over the old one: the slot
+    simply behaves as though it had started late with a shorter window.
+
+    require_dark asks "is the screen actually empty?" and is what keeps this
+    off the operator's back: recovering from a crash must never interrupt
+    something a person started by hand.  A slot that simply has not managed to
+    launch yet passes False -- taking the screen at its scheduled time is its
+    job, and is what it would have done anyway.
+    """
+    if run.deadline is None:
+        return False                 # no end_time, so no knowable window to fill
+    if _kill_generation != run.kill_generation:
+        return False                 # ended deliberately; the next slot has the screen
+    if require_dark and _vlc_is_running():
+        return False                 # something is on screen; leave it alone
+    if run.attempt >= RELAUNCH_MAX_ATTEMPTS:
+        log.error(
+            f"{reason} — already restarted {run.attempt} time(s) in this slot, "
+            f"giving up until the next scheduled slot."
+        )
+        return False
+
+    remaining = run.deadline - time.monotonic()
+    if remaining < RELAUNCH_MIN_REMAINING_SECONDS:
+        return False                 # window all but over; let the next slot have it
+
+    log.warning(
+        f"{reason} — {remaining/60:.0f}m of the window left, restarting the slot "
+        f"in {delay:.0f}s (attempt {run.attempt + 1}/{RELAUNCH_MAX_ATTEMPTS})"
+    )
+    # The pause runs in its own thread: this is called both from a watchdog
+    # thread and from the scheduler's main loop, where sleeping would hold up
+    # every other slot.
+    threading.Thread(target=_delayed_relaunch, args=(run, delay, require_dark),
+                     daemon=True).start()
+    return True
+
+
+def _delayed_relaunch(run: _SlotRun, delay: float, require_dark: bool = True) -> None:
+    time.sleep(delay)
+
+    # Re-check what the pause may have changed.  The window between VLC dying
+    # and this firing is exactly when an operator would start something by hand.
+    if _kill_generation != run.kill_generation:
+        log.info("Slot restart cancelled — another slot took the screen.")
+        return
+    if require_dark and _vlc_is_running():
+        log.info("Slot restart cancelled — VLC is playing again already.")
+        return
+    remaining = run.deadline - time.monotonic()
+    if remaining < RELAUNCH_MIN_REMAINING_SECONDS:
+        log.info("Slot restart cancelled — the window closed while waiting.")
+        return
+
+    try:
+        play_videos(run.folder_entries, run.vlc_path, run.extensions,
+                    run.before_play, remaining, run.is_mirror,
+                    _deadline=run.deadline, _attempt=run.attempt + 1)
+    except Exception:
+        log.exception("Slot restart failed")
+
+
+def _watch_mirror(proc: subprocess.Popen, run: _SlotRun) -> None:
+    """Guard a mirror slot's screen.  Mirrors never reach _on_vlc_exit -- they
+    confirm no rotation -- so they need their own watchdog, which relaunches
+    and still writes nothing."""
+    if run.deadline is None:
+        return
+
+    def _wait() -> None:
+        proc.wait()
+        _retry_slot(run, RELAUNCH_BACKOFF_SECONDS, "[MIRROR] VLC exited on its own")
+
+    threading.Thread(target=_wait, daemon=True).start()
+
+
 # ── Playback ──────────────────────────────────────────────────────────────────
 
 def play_videos(folder_entries: list, vlc_path: str, extensions: list,
                 before_play: Optional[str] = None,
                 window_seconds: Optional[float] = None,
                 is_mirror: bool = False,
-                wait_for_exit: bool = False) -> None:
+                wait_for_exit: bool = False,
+                on_air_seconds: Optional[float] = None,
+                _deadline: Optional[float] = None,
+                _attempt: int = 0) -> None:
     global _active_proc
 
     state     = load_state()
     state_key = folder_entries[0]["path"]
+
+    # Absolute monotonic time at which this slot stops owning the screen.
+    # Derived here rather than passed in, because a scheduled job binds its
+    # arguments days before it fires.  None leaves the slot unsupervised: a
+    # slot with no end_time has no knowable end, and --play-now is a manual
+    # one-shot that should not resurrect itself.
+    deadline = _deadline
+    if deadline is None and on_air_seconds is not None:
+        deadline = time.monotonic() + on_air_seconds
 
     if is_mirror:
         # Mirror slot: replay the previous calendar day's primary session.
@@ -755,6 +959,17 @@ def play_videos(folder_entries: list, vlc_path: str, extensions: list,
             new_resume_offset = 0.0
 
     if not videos:
+        # Nothing playable right now -- an unreadable folder, or every episode
+        # failing to probe.  The previous slot's VLC was deliberately left
+        # running (kill_vlc() has not been called yet), so the screen is not
+        # black; the slot just has not taken over.  Try again inside the window.
+        _retry_slot(
+            _SlotRun(folder_entries, vlc_path, extensions, before_play,
+                     is_mirror, deadline, _attempt, _kill_generation),
+            RETRY_NO_VIDEO_SECONDS,
+            f"No episode selected for {state_key}",
+            require_dark=False,
+        )
         return
 
     names = ", ".join(v.name for v in videos)
@@ -811,6 +1026,9 @@ def play_videos(folder_entries: list, vlc_path: str, extensions: list,
 
         if is_mirror:
             log.info("[MIRROR] State unchanged — primary slot manages progression")
+            _watch_mirror(_active_proc, _SlotRun(
+                folder_entries, vlc_path, extensions, before_play,
+                is_mirror, deadline, _attempt, _kill_generation))
             return
 
         launched_at = time.monotonic()
@@ -850,6 +1068,19 @@ def play_videos(folder_entries: list, vlc_path: str, extensions: list,
             resume_offset_save = 0.0
             if window_seconds is not None:
                 log.info("Next session starts from beginning (no overshoot)")
+
+        # What the watchdog should expect VLC to stay up for.  When the batch
+        # overshoots the window, the slot's own end arrives first and that is
+        # the expectation; when the folder ran short, the content is all there
+        # is, so it is measured (re-probing only the few files just selected).
+        if window_seconds is None:
+            expected_content = None
+        elif new_resume_offset > 0:
+            expected_content = window_seconds
+        else:
+            expected_content = max(
+                0.0, sum(get_video_duration(v) for v in videos) - resume_offset
+            )
 
         session_at = datetime.datetime.now().isoformat()
 
@@ -906,15 +1137,21 @@ def play_videos(folder_entries: list, vlc_path: str, extensions: list,
                 new_state["pending_resume_offset"] = resume_offset_save
             fresh_state[state_key] = new_state
 
+        # _kill_generation is read after this function's own kill_vlc(), so a
+        # later change to it means somebody else stopped our VLC.
+        run = _SlotRun(folder_entries, vlc_path, extensions, before_play,
+                       is_mirror, deadline, _attempt, _kill_generation,
+                       expected_content)
+
         if wait_for_exit:
             # One-shot invocation (--play-now): confirm the session in the
             # foreground.  A daemon thread would die the instant main() returns,
             # leaving pending_* unpromoted and this folder frozen forever.
-            _on_vlc_exit(_active_proc, state_key, session_at, launched_at)
+            _on_vlc_exit(_active_proc, state_key, session_at, launched_at, run)
         else:
             threading.Thread(
                 target=_on_vlc_exit,
-                args=(_active_proc, state_key, session_at, launched_at),
+                args=(_active_proc, state_key, session_at, launched_at, run),
                 daemon=True,
             ).start()
 
@@ -1050,7 +1287,7 @@ def _apply_manual_advance(state: dict, state_key: str, folder_index: int,
 
 
 def _on_vlc_exit(proc: subprocess.Popen, state_key: str, session_at: str,
-                 launched_at: float) -> None:
+                 launched_at: float, run: Optional["_SlotRun"] = None) -> None:
     """Confirm the session once VLC has actually exited.
 
     Waits without a timeout on purpose: the wait must end when VLC ends, never
@@ -1066,6 +1303,26 @@ def _on_vlc_exit(proc: subprocess.Popen, state_key: str, session_at: str,
     proc.wait()
 
     elapsed = time.monotonic() - launched_at
+
+    # Did VLC get through what it was given, or did it die holding most of it?
+    played_through = (
+        run is not None
+        and run.content_seconds is not None
+        and elapsed >= run.content_seconds - COMPLETION_SLACK_SECONDS
+    )
+
+    if run is not None and not played_through:
+        # Died early and nobody asked it to.  Replay the remaining window
+        # rather than leaving the screen black: the rotation is deliberately
+        # left uncommitted below, so the relaunch re-selects this same batch
+        # instead of skipping past episodes nobody saw.
+        held = ""
+        if run.content_seconds:
+            held = f" holding {max(0.0, run.content_seconds - elapsed)/60:.0f}m of unplayed video"
+        if _retry_slot(run, RELAUNCH_BACKOFF_SECONDS,
+                       f"VLC exited on its own after {elapsed/60:.0f}m{held}"):
+            return
+
     if elapsed < ABNORMAL_EXIT_SECONDS:
         # No configured slot is this short, so VLC crashed or was quit right
         # after launch.  Leaving pending_* unpromoted makes the next session
@@ -1093,6 +1350,14 @@ def _on_vlc_exit(proc: subprocess.Popen, state_key: str, session_at: str,
                 )
     except Exception:
         log.exception("Error marking session complete")
+        return
+
+    if played_through:
+        # The playlist ran out before the slot's window did -- a folder that
+        # reached its last episode, usually.  The rotation is committed by now,
+        # so a restart picks up the NEXT batch rather than replaying this one.
+        _retry_slot(run, RELAUNCH_BACKOFF_SECONDS,
+                    f"{state_key} played its whole batch in {elapsed/60:.0f}m")
 
 
 def startup_catchup(config: dict, vlc_path: str, extensions: list) -> None:
@@ -1139,6 +1404,9 @@ def startup_catchup(config: dict, vlc_path: str, extensions: list) -> None:
                 get_folder_entries(primary), vlc_path, extensions,
                 entry.get("before_play") or primary.get("before_play"),
                 _window_seconds(primary), True,
+                on_air_seconds=(
+                    scheduled_dt + datetime.timedelta(seconds=window) - now
+                ).total_seconds(),
             )
             return
 
@@ -1165,7 +1433,12 @@ def startup_catchup(config: dict, vlc_path: str, extensions: list) -> None:
                 f"(last played {last_at}, slot was {scheduled_dt.strftime('%Y-%m-%d %H:%M')})"
             )
             play_videos(fes, vlc_path, extensions, entry.get("before_play"),
-                        _window_seconds(entry))
+                        _window_seconds(entry),
+                        on_air_seconds=(
+                            (scheduled_dt + datetime.timedelta(seconds=window)
+                             - now).total_seconds()
+                            if window is not None else None
+                        ))
             return
 
     log.info("Startup: no missed slots — resuming normal schedule.")
@@ -1195,8 +1468,12 @@ def _register_schedules(config: dict) -> None:
             if before_play is None:
                 before_play = ref_entry.get("before_play")
             log.info(f"  Registered  {t}  →  mirror of {ref_time}  ({fes[0]['path']})")
+            # A mirror is on air for its OWN window, which need not match the
+            # primary whose session it replays (10:00-11:00 mirrors 19:00-21:00).
+            mirror_on_air = _window_seconds(entry)
             schedule.every().day.at(t).do(
-                play_videos, fes, vlc_path, extensions, before_play, window_seconds, True
+                play_videos, fes, vlc_path, extensions, before_play, window_seconds, True,
+                on_air_seconds=(mirror_on_air if mirror_on_air is not None else window_seconds),
             )
             continue
 
@@ -1210,7 +1487,8 @@ def _register_schedules(config: dict) -> None:
             else:
                 log.info(f"  Registered  {t}  →  {fe['path']}  (count={fe['count']})")
         schedule.every().day.at(t).do(
-            play_videos, fes, vlc_path, extensions, before_play, window_seconds
+            play_videos, fes, vlc_path, extensions, before_play, window_seconds,
+            on_air_seconds=window_seconds,
         )
 
 
