@@ -97,12 +97,16 @@ def _run(vs, *, deadline_in=3600.0, attempt=0, content=7200.0, is_mirror=False):
 class _Proc:
     """Stand-in for a VLC process that exits when released."""
 
-    def __init__(self, release=None):
+    def __init__(self, release=None, alive=True):
         self._release = release
+        self._alive   = alive
 
     def wait(self):
         if self._release is not None:
             self._release()
+
+    def poll(self):
+        return None if self._alive else 0
 
 
 # ── The bug ───────────────────────────────────────────────────────────────────
@@ -1100,6 +1104,197 @@ def test_shift_records_the_folder_it_lands_in():
         state = {}
         vs._apply_manual_advance(state, "A", 1, "ep03", 0.0, "/videos/B")
         assert state["A"]["folder_progress"]["/videos/B"]["last_played"] == "ep03", state
+
+
+# ── The last slot of the day: commit on the window, not on VLC's exit ─────────
+
+def _orphan(vs, tmp, *, closed_h_ago, started_h_ago):
+    """A session with a recorded window end, left unconfirmed."""
+    import datetime
+    now     = datetime.datetime.now()
+    started = now - datetime.timedelta(hours=started_h_ago)
+    folder  = _folder(tmp, "series", 3)
+    vs.save_state({str(folder): _session(
+        last_session_at=started.isoformat(),
+        pending_window_ends_at=(now - datetime.timedelta(hours=closed_h_ago)).isoformat(),
+    )})
+    return str(folder), started
+
+
+def test_a_launch_records_when_its_window_closes():
+    """Without the stamp a restart cannot tell a filled window from a cut one."""
+    import datetime
+    with sandbox() as (vs, tmp):
+        vs.kill_vlc = lambda: None
+        vs.get_video_duration = lambda path: 1000.0
+        folder = _folder(tmp, "A", 4)
+
+        class _Alive:
+            pid = 4242
+            def poll(self):      return None
+            def wait(self):      time.sleep(30)
+            def terminate(self): pass
+
+        armed = []
+        vs._confirm_at_window_end = lambda *a: armed.append(a)
+
+        real_popen = vs.subprocess.Popen
+        vs.subprocess.Popen = lambda argv, **kw: _Alive()
+        try:
+            vs.play_videos([{"path": str(folder), "count": 1}], "/bin/true",
+                           [".mp4"], None, 1500.0, on_air_seconds=1500.0)
+        finally:
+            vs.subprocess.Popen = real_popen
+
+        _wait_for(lambda: armed, what="the window-end timer")
+        assert armed[0][1] == str(folder), armed
+
+        entry = vs.load_state()[str(folder)]
+        stamp = entry.get("pending_window_ends_at")
+        assert stamp, f"no window end recorded: {entry}"
+        left = (datetime.datetime.fromisoformat(stamp)
+                - datetime.datetime.now()).total_seconds()
+        assert 1400 < left <= 1500, f"window end is {left}s away, expected ~1500"
+
+
+def test_the_window_closing_commits_a_slot_still_on_screen():
+    """The 21:00 slot must not wait for the 06:00 mirror to kill its VLC."""
+    with sandbox() as (vs, _tmp):
+        vs.save_state({"A": _session()})
+        vs._confirm_at_window_end(_Proc(), "A", "T-A", time.monotonic() - 1)
+        a = vs.load_state()["A"]
+        assert a["session_completed"] is True, a
+        assert a["last_played"] == "ep02", a
+        assert "pending_window_ends_at" not in a, a
+
+
+def test_the_window_closing_leaves_a_dark_screen_to_the_exit_watcher():
+    """VLC gone before the window ended means nobody watched the rest of it."""
+    with sandbox() as (vs, _tmp):
+        vs.save_state({"A": _session()})
+        vs._confirm_at_window_end(_Proc(alive=False), "A", "T-A", time.monotonic() - 1)
+        a = vs.load_state()["A"]
+        assert a["session_completed"] is False, a
+        assert a["last_played"] == "ep01", f"skipped episodes nobody saw: {a}"
+
+
+def test_the_window_end_commit_leaves_a_superseded_session_alone():
+    """A watchdog restart writes a newer session; the stale timer must not fire."""
+    with sandbox() as (vs, _tmp):
+        vs.save_state({"A": _session(last_session_at="T-B", pending_last_played="ep09")})
+        vs._confirm_at_window_end(_Proc(), "A", "T-A", time.monotonic() - 1)
+        a = vs.load_state()["A"]
+        assert a["session_completed"] is False, a
+        assert a["last_played"] == "ep01", a
+
+
+def test_the_two_commit_paths_do_not_double_advance():
+    """Window end and VLC exit both fire for one session; it advances once."""
+    with sandbox() as (vs, _tmp):
+        vs.ABNORMAL_EXIT_SECONDS = 0.0
+        vs._vlc_is_running = lambda: False
+        vs.save_state({"A": _session()})
+
+        vs._confirm_at_window_end(_Proc(), "A", "T-A", time.monotonic() - 1)
+        after_timer = vs.load_state()["A"]
+
+        # Hours later the morning mirror kills it and the exit watcher wakes.
+        vs._on_vlc_exit(_Proc(), "A", "T-A", time.monotonic() - 32400,
+                        _run(vs, deadline_in=-1.0))
+
+        a = vs.load_state()["A"]
+        assert a["last_played"] == after_timer["last_played"] == "ep02", a
+        assert a["resume_offset"] == 42.0, a
+
+
+def test_a_window_that_closed_while_we_were_down_is_committed():
+    """Restart the scheduler at 23:04 and the 21:00 slot must not replay tomorrow."""
+    import datetime
+    with sandbox() as (vs, tmp):
+        key, started = _orphan(vs, tmp, closed_h_ago=1, started_h_ago=3)
+        vs._boot_time = lambda: started - datetime.timedelta(hours=5)
+        vs._promote_orphaned_pendings()
+        a = vs.load_state()[key]
+        assert a["session_completed"] is True, a
+        assert a["last_played"] == "ep02", a
+        assert "pending_window_ends_at" not in a, a
+
+
+def test_a_reboot_during_the_session_leaves_the_batch_to_replay():
+    """A cut takes VLC down with the scheduler, so the window was never filled."""
+    import datetime
+    with sandbox() as (vs, tmp):
+        key, started = _orphan(vs, tmp, closed_h_ago=1, started_h_ago=3)
+        vs._boot_time = lambda: started + datetime.timedelta(minutes=30)
+        vs._promote_orphaned_pendings()
+        a = vs.load_state()[key]
+        assert a["session_completed"] is False, a
+        assert a["last_played"] == "ep01", f"skipped episodes nobody saw: {a}"
+
+
+def test_a_window_still_open_is_left_to_the_catch_up():
+    """Mid-window the slot gets resumed, not quietly rotated past."""
+    import datetime
+    with sandbox() as (vs, tmp):
+        key, started = _orphan(vs, tmp, closed_h_ago=-1, started_h_ago=1)
+        vs._boot_time = lambda: started - datetime.timedelta(hours=5)
+        vs._promote_orphaned_pendings()
+        assert vs.load_state()[key]["last_played"] == "ep01"
+
+
+def test_an_unreadable_boot_time_never_advances_the_rotation():
+    with sandbox() as (vs, tmp):
+        key, _started = _orphan(vs, tmp, closed_h_ago=1, started_h_ago=3)
+        vs._boot_time = lambda: None
+        vs._promote_orphaned_pendings()
+        assert vs.load_state()[key]["last_played"] == "ep01"
+
+
+def test_a_slot_with_no_recorded_window_is_left_alone():
+    """Count-based slots have no window end, so there is nothing to conclude."""
+    with sandbox() as (vs, _tmp):
+        vs.save_state({"A": _session()})          # no pending_window_ends_at
+        vs._boot_time = lambda: None
+        vs._promote_orphaned_pendings()
+        assert vs.load_state()["A"]["last_played"] == "ep01"
+
+
+def test_a_dry_run_repairs_nothing():
+    """--dry-run reports what would happen; it must not touch the state file."""
+    import datetime
+    with sandbox() as (vs, tmp):
+        key, started = _orphan(vs, tmp, closed_h_ago=1, started_h_ago=3)
+        vs._boot_time = lambda: started - datetime.timedelta(hours=5)
+        vs._dry_run = True
+        vs._promote_orphaned_pendings()
+        assert vs.load_state()[key]["last_played"] == "ep01"
+
+
+def test_the_repaired_slot_is_not_also_replayed_on_startup():
+    """Committing it must also stop it looking interrupted to the catch-up."""
+    import datetime
+    with sandbox() as (vs, tmp):
+        started = (datetime.datetime.now() - datetime.timedelta(hours=3)
+                   ).replace(second=0, microsecond=0)
+        ends    = started + datetime.timedelta(hours=2)
+        folder  = _folder(tmp, "series", 3)
+        vs.save_state({str(folder): _session(
+            last_session_at=started.isoformat(),
+            pending_window_ends_at=ends.isoformat(),
+        )})
+        vs._boot_time = lambda: started - datetime.timedelta(hours=5)
+        config = {"video_extensions": [".mp4"], "schedules": [{
+            "time":     started.strftime("%H:%M"),
+            "end_time": ends.strftime("%H:%M"),
+            "folders":  [{"path": str(folder)}],
+        }]}
+        played = []
+        vs.play_videos = lambda *a, **k: played.append(a)
+        vs.startup_catchup(config, "/bin/true", [".mp4"])
+
+        assert not played, "a window that already closed must not start playing now"
+        a = vs.load_state()[str(folder)]
+        assert a["session_completed"] is True and a["last_played"] == "ep02", a
 
 
 def main() -> int:

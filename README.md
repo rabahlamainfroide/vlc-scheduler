@@ -16,6 +16,7 @@ Automatically plays the next numbered video(s) from designated folders at schedu
 - **Stale VLC Cleanup**: Kills any leftover VLC instance before starting a new one
 - **Pre-play Hooks**: Run a shell command before each playback (e.g. reset screensaver, set volume)
 - **Screen watchdog**: If VLC dies while a slot still owns the screen, the slot restarts and plays out the rest of its window instead of leaving a black screen until the next slot. Manual playback is never interrupted
+- **Window-end commit**: A slot's position advances when its window closes, not when VLC happens to exit — so the last slot of the day, whose player runs on for hours with nothing scheduled behind it, cannot lose a night's progress to a restart
 - **Startup Catch-up**: If the machine reboots mid-playback or while a scheduled slot was missed, the scheduler immediately plays that slot on startup instead of waiting for the next one
 - **Config Hot-reload**: Edit `config.json` while running — changes take effect within 30 s
 - **Status Endpoint**: Live JSON status at `http://127.0.0.1:8765/`
@@ -546,6 +547,39 @@ by hand (`--play-now`, or launching VLC yourself) therefore stops the watchdog
 from interfering, since it can see something is already on screen.
 
 Slots without an `end_time` have no knowable end, so they are not supervised.
+
+### When a slot's position is committed
+
+A slot predicts where it will end up the moment it launches, but writes that
+prediction to `pending_*` and only promotes it once there is evidence the
+episodes were really on screen. Two things provide that evidence, whichever
+comes first:
+
+| | Commits when | Evidence |
+|---|---|---|
+| **Window-end timer** | The slot's `end_time` arrives | Our VLC is still running |
+| **Exit watcher** | VLC exits | It got through the batch, or the next slot took over |
+
+The timer is what makes the *last* slot of the day safe. Nothing is scheduled
+behind it, so nobody kills its VLC at its `end_time` — it plays on until the
+next morning's mirror takes the screen, some nine hours later. Hanging the
+commit on that exit put the whole night at the mercy of a restart: stop the
+scheduler at 23:04 and the waiting thread died still holding an uncommitted
+position, so the next evening replayed the same two episodes.
+
+If the scheduler is not running when the window closes, neither path fires. The
+next startup repairs that, using the machine's boot time as the evidence
+instead:
+
+- **Up continuously since the session started** → VLC cannot have stopped,
+  because killing the scheduler does not kill the player it spawned. The window
+  was filled, so the position is committed.
+- **Rebooted during the session** → VLC went down with it and the window was
+  not filled. The position stays put and that batch replays, which is the whole
+  point of deferring the commit.
+
+Slots without an `end_time` have no window to close, so they keep the old
+behaviour: their position is committed when the next slot takes the screen.
 
 ### When a folder cannot be read
 

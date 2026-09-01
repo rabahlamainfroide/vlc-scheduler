@@ -843,6 +843,17 @@ def _vlc_is_running() -> bool:
         return True          # assume something is playing rather than interrupt it
 
 
+def _boot_time() -> Optional[datetime.datetime]:
+    """When this machine last booted, or None if it cannot be read."""
+    try:
+        with open("/proc/uptime") as fh:
+            up = float(fh.read().split()[0])
+    except Exception:
+        log.warning("Could not read /proc/uptime — treating boot time as unknown")
+        return None
+    return datetime.datetime.now() - datetime.timedelta(seconds=up)
+
+
 def _retry_slot(run: _SlotRun, delay: float, reason: str,
                 require_dark: bool = True) -> bool:
     """Put a slot back on screen if it should still own it.  True if scheduled.
@@ -1130,6 +1141,18 @@ def play_videos(folder_entries: list, vlc_path: str, extensions: list,
 
         session_at = datetime.datetime.now().isoformat()
 
+        # The in-process timer below cannot fire if the daemon is not running
+        # when the window closes, so the same instant is written down here for
+        # _promote_orphaned_pendings() to pick up at the next startup.  It is
+        # derived from the monotonic deadline rather than from end_time: a slot
+        # resumed mid-window owns only what is left of it.
+        window_ends_at = None
+        if deadline is not None:
+            window_ends_at = (
+                datetime.datetime.now()
+                + datetime.timedelta(seconds=deadline - time.monotonic())
+            ).isoformat()
+
         # Re-read the state under the lock rather than reusing the snapshot
         # taken at the top of this function.  kill_vlc() above has just made
         # the previous slot's VLC exit, so that slot's _on_vlc_exit thread is
@@ -1182,6 +1205,8 @@ def play_videos(folder_entries: list, vlc_path: str, extensions: list,
             if window_seconds is not None:
                 new_state["resume_offset"]         = old_state.get("resume_offset", 0.0)
                 new_state["pending_resume_offset"] = resume_offset_save
+            if window_ends_at is not None:
+                new_state["pending_window_ends_at"] = window_ends_at
             fresh_state[state_key] = new_state
 
         # _kill_generation is read after this function's own kill_vlc(), so a
@@ -1189,6 +1214,16 @@ def play_videos(folder_entries: list, vlc_path: str, extensions: list,
         run = _SlotRun(folder_entries, vlc_path, extensions, before_play,
                        is_mirror, deadline, _attempt, _kill_generation,
                        expected_content)
+
+        if deadline is not None and not wait_for_exit:
+            # Whichever of these two reaches _confirm_session first wins; the
+            # timer exists because for the last slot of the day the exit
+            # watcher does not wake until the following morning.
+            threading.Thread(
+                target=_confirm_at_window_end,
+                args=(_active_proc, state_key, session_at, deadline),
+                daemon=True,
+            ).start()
 
         if wait_for_exit:
             # One-shot invocation (--play-now): confirm the session in the
@@ -1322,6 +1357,7 @@ def _finalize_pending(entry: dict) -> None:
         entry["last_played"] = entry.pop("pending_last_played")
     if "pending_resume_offset" in entry:
         entry["resume_offset"] = entry.pop("pending_resume_offset")
+    entry.pop("pending_window_ends_at", None)
     _remember_folder(entry, entry.pop("pending_folder_path", None))
     entry["session_completed"] = True
 
@@ -1339,7 +1375,8 @@ def _apply_manual_advance(state: dict, state_key: str, folder_index: int,
     entry = state.get(state_key, {})
     if not isinstance(entry, dict):
         entry = {}
-    for key in ("pending_folder_index", "pending_last_played", "pending_resume_offset"):
+    for key in ("pending_folder_index", "pending_last_played", "pending_resume_offset",
+                "pending_window_ends_at"):
         entry.pop(key, None)
     entry["folder_index"]      = folder_index
     entry["last_played"]       = last_played
@@ -1348,6 +1385,64 @@ def _apply_manual_advance(state: dict, state_key: str, folder_index: int,
         entry["resume_offset"] = resume_offset
     _remember_folder(entry, folder_path)
     state[state_key] = entry
+
+
+def _confirm_session(state_key: str, session_at: str, why: str) -> bool:
+    """Promote one session's predicted rotation.  False if the write failed.
+
+    Two things now race to do this -- the window-end timer and the VLC-exit
+    watcher -- and the last_session_at guard is what makes that safe.  Whichever
+    arrives first commits; the loser sees session_completed already set and
+    keeps quiet, and a session that a newer one has replaced leaves the
+    rotation to it rather than dragging it backwards.
+    """
+    try:
+        with state_transaction() as state:
+            entry = state.get(state_key, {})
+            if not isinstance(entry, dict) or entry.get("last_session_at") != session_at:
+                log.info(
+                    f"Session for {state_key} superseded by a newer one — "
+                    f"leaving rotation to it."
+                )
+            elif entry.get("session_completed"):
+                pass                     # the other path got there first
+            else:
+                _finalize_pending(entry)
+                state[state_key] = entry
+                log.info(
+                    f"Session confirmed for {state_key} {why} — "
+                    f"rotation advanced to last_played={entry.get('last_played')!r}"
+                )
+    except Exception:
+        log.exception("Error marking session complete")
+        return False
+    return True
+
+
+def _confirm_at_window_end(proc: subprocess.Popen, state_key: str,
+                           session_at: str, deadline: float) -> None:
+    """Commit the rotation when the slot's window closes, not when VLC exits.
+
+    The last slot of the day has nothing scheduled behind it, so its VLC is
+    never killed at its end_time -- it plays on until the next morning's mirror
+    takes the screen, some nine hours later.  Hanging the commit on that exit
+    put a whole night's rotation at the mercy of a restart: kill the scheduler
+    at 23:04 and the _on_vlc_exit thread died still holding an uncommitted
+    pending_*, so the next evening replayed the same two episodes.
+
+    Committing here needs the window to have actually been filled, and our own
+    VLC still being alive is exactly that evidence.  If it died early, the
+    watchdog either put a fresh session on screen (which supersedes this one)
+    or gave up on a dark screen; either way the rotation has to stay where it
+    is so nothing unwatched is skipped, so this steps aside and leaves the
+    decision to _on_vlc_exit.
+    """
+    remaining = deadline - time.monotonic()
+    if remaining > 0:
+        time.sleep(remaining)
+
+    if proc.poll() is None:
+        _confirm_session(state_key, session_at, "at the end of its window")
 
 
 def _on_vlc_exit(proc: subprocess.Popen, state_key: str, session_at: str,
@@ -1397,23 +1492,7 @@ def _on_vlc_exit(proc: subprocess.Popen, state_key: str, session_at: str,
         )
         return
 
-    try:
-        with state_transaction() as state:
-            entry = state.get(state_key, {})
-            if isinstance(entry, dict) and entry.get("last_session_at") == session_at:
-                _finalize_pending(entry)
-                state[state_key] = entry
-                log.info(
-                    f"Session confirmed for {state_key} after {elapsed/60:.0f}m — "
-                    f"rotation advanced to last_played={entry.get('last_played')!r}"
-                )
-            else:
-                log.info(
-                    f"Session for {state_key} superseded by a newer one — "
-                    f"leaving rotation to it."
-                )
-    except Exception:
-        log.exception("Error marking session complete")
+    if not _confirm_session(state_key, session_at, f"after {elapsed/60:.0f}m"):
         return
 
     if played_through:
@@ -1424,9 +1503,65 @@ def _on_vlc_exit(proc: subprocess.Popen, state_key: str, session_at: str,
                     f"{state_key} played its whole batch in {elapsed/60:.0f}m")
 
 
+def _promote_orphaned_pendings() -> None:
+    """Commit sessions whose window closed while the scheduler was not running.
+
+    _confirm_at_window_end() covers the ordinary case, but it lives inside the
+    daemon: restart at 22:00 and the 21:00 slot's timer goes with it, even
+    though VLC is a separate process that carries on playing to 23:00 and past
+    it.  Left alone that session never commits, and the next evening replays
+    exactly the episodes that were on screen the night before.
+
+    Promoting needs proof the video really did play the window out, and the
+    boot time is that proof: if the machine has been up continuously since the
+    session started, nothing could have stopped VLC, because killing the
+    scheduler does not kill the player it spawned.  A reboot inside that span
+    is the opposite case -- VLC went down with it and the window was not
+    filled -- so those are left untouched, and replaying them is right.
+    """
+    booted = _boot_time()
+    now    = datetime.datetime.now()
+
+    for state_key, entry in load_state().items():
+        if not isinstance(entry, dict) or entry.get("session_completed", True):
+            continue
+        ends_at = entry.get("pending_window_ends_at")
+        started = entry.get("last_session_at")
+        if not ends_at or not started:
+            continue                     # no window, or nothing to promote
+        try:
+            ends_dt    = datetime.datetime.fromisoformat(ends_at)
+            started_dt = datetime.datetime.fromisoformat(started)
+        except ValueError:
+            log.warning(f"{state_key}: unreadable session timestamps — leaving rotation alone")
+            continue
+
+        if now < ends_dt:
+            continue                     # still on air; startup_catchup resumes it
+        if booted is None or booted > started_dt:
+            log.info(
+                f"{state_key}: window closed at {ends_dt:%H:%M} but the machine "
+                f"went down during the session — that batch will replay."
+            )
+            continue
+
+        if _dry_run:
+            log.info(f"[DRY RUN] Would confirm {state_key} — its window closed "
+                     f"at {ends_dt:%H:%M} with the machine up throughout")
+            continue
+
+        _confirm_session(state_key, started,
+                         f"at the end of its window ({ends_dt:%H:%M}, while nothing was running)")
+
+
 def startup_catchup(config: dict, vlc_path: str, extensions: list) -> None:
     """On startup, play the most recently missed or interrupted schedule slot."""
-    now   = datetime.datetime.now()
+    now = datetime.datetime.now()
+
+    # Before deciding what to resume: a slot whose window closed unattended has
+    # already earned its rotation, and leaving it uncommitted would both replay
+    # it tonight and make it look "interrupted" to the scan below.
+    _promote_orphaned_pendings()
     state = load_state()
 
     candidates = []
