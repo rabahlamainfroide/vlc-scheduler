@@ -622,6 +622,8 @@ python3 vlc_scheduler.py
 
 On startup the scheduler checks whether the most recently passed schedule slot was missed or interrupted (e.g. due to a power cut). If it was, that slot plays immediately rather than waiting for the next scheduled time. Normal restarts where all slots completed cleanly do nothing extra.
 
+A slot resumed this way gets a batch sized to what is *left* of its window, not to the whole window. Restart a two-hour slot with one hour to go and it selects one hour of episodes, so the position committed when the window closes matches what actually reached the screen. Sizing the batch to the full window instead left its tail unplayed but still rotated past it, quietly skipping episodes on every mid-window restart.
+
 ### Dry run
 
 Preview what would play at each scheduled time without launching VLC:
