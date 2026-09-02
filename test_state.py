@@ -602,6 +602,83 @@ def test_catchup_still_resumes_a_count_based_slot_with_no_window():
         vs.play_videos = lambda *a, **k: played.append(a)
         vs.startup_catchup(config, "/bin/true", [".mp4"])
         assert played, "a count-based slot has no window to fall outside of"
+        assert played[0][4] is None, (
+            f"a slot with no window must be sized by count, got {played[0][4]!r}"
+        )
+
+
+def test_catchup_sizes_the_batch_to_what_is_left_of_the_window():
+    """A slot picked up part-way owns only the rest of its window.
+
+    Sizing the batch to the configured window instead built a plan longer than
+    the airtime left to play it, and the commit at the window's end rotated
+    across the whole plan -- so its tail went unwatched.
+    """
+    import datetime
+    with sandbox() as (vs, tmp):
+        now = datetime.datetime.now()
+        # a 2h slot that started an hour ago: an hour of it is left
+        config = _interrupted_primary(vs, tmp, now, started_h_ago=1, window_h=2)
+        played = []
+        vs.play_videos = lambda *a, **k: played.append((a, k))
+        vs.startup_catchup(config, "/bin/true", [".mp4"])
+        assert played, "a slot still on air must be resumed"
+
+        window_seconds = played[0][0][4]
+        on_air         = played[0][1]["on_air_seconds"]
+        assert 3500 < window_seconds <= 3600, (
+            f"batch sized to {window_seconds}s -- expected the ~3600s left, "
+            f"not the 7200s the slot is configured for"
+        )
+        assert window_seconds == on_air, (
+            f"selection ({window_seconds}s) and deadline ({on_air}s) must agree, "
+            f"or the watchdog reads the closing kill as an early death"
+        )
+
+
+def test_a_resumed_slot_stages_only_the_rotation_it_can_air():
+    """What gets committed must not run past what the window had room for.
+
+    A 2h slot restarted with an hour left used to select a full two hours of
+    episodes and then, when the window closed, commit all of them -- so the
+    hour that never reached the screen was rotated past unwatched.  This drives
+    the real catch-up path, because the sizing decision lives at its call site.
+    """
+    import datetime
+    with sandbox() as (vs, tmp):
+        vs.kill_vlc               = lambda: None
+        vs.get_video_duration     = lambda path: 1000.0
+        vs._confirm_at_window_end = lambda *a: None
+        _folder(tmp, "series", 12)          # _interrupted_primary reuses this
+
+        class _Alive:
+            pid = 4242
+            def poll(self):      return None
+            def wait(self):      time.sleep(30)
+            def terminate(self): pass
+
+        now    = datetime.datetime.now()
+        config = _interrupted_primary(vs, tmp, now, started_h_ago=1, window_h=2)
+        folder = str(tmp / "series")
+
+        real_popen = vs.subprocess.Popen
+        vs.subprocess.Popen = lambda argv, **kw: _Alive()
+        try:
+            vs.startup_catchup(config, "/bin/true", [".mp4"])
+        finally:
+            vs.subprocess.Popen = real_popen
+
+        # Every episode but the last is staged whole; the last is staged only
+        # as far as pending_resume_offset says the next session should pick up.
+        entry  = vs.load_state()[folder]
+        staged = (1000.0 * (len(entry["last_session_videos"]) - 1)
+                  + entry["pending_resume_offset"]
+                  - entry["last_session_resume_offset"])
+        assert 3500 < staged <= 3600, (
+            f"staged {staged:.0f}s of rotation with ~3600s of window left: "
+            f"{entry['last_session_videos']} resuming at "
+            f"{entry['pending_resume_offset']}s"
+        )
 
 
 # ── Dead air: VLC going away mid-window ───────────────────────────────────────

@@ -1627,17 +1627,26 @@ def startup_catchup(config: dict, vlc_path: str, extensions: list) -> None:
 
         if missed or interrupted:
             reason = "missed" if missed else "interrupted"
+            # A slot picked up part-way owns only what is left of its window,
+            # so the batch is sized to that rather than to the configured
+            # window.  Sizing it to the full window built a plan longer than
+            # the airtime left for it, and the commit at the window's end
+            # advanced the rotation across the whole plan -- so its tail, a
+            # quarter of an hour of episodes nobody saw, was skipped.  It also
+            # keeps expected_content equal to the deadline, so the kill that
+            # closes the window reads as a full run rather than an early death.
+            remaining = None
+            if window is not None:
+                remaining = (scheduled_dt + datetime.timedelta(seconds=window)
+                             - now).total_seconds()
             log.info(
                 f"Startup catch-up: slot {entry['time']} was {reason} "
                 f"(last played {last_at}, slot was {scheduled_dt.strftime('%Y-%m-%d %H:%M')})"
+                + (f" — {remaining/60:.0f}m of its window left"
+                   if remaining is not None else "")
             )
             play_videos(fes, vlc_path, extensions, entry.get("before_play"),
-                        _window_seconds(entry),
-                        on_air_seconds=(
-                            (scheduled_dt + datetime.timedelta(seconds=window)
-                             - now).total_seconds()
-                            if window is not None else None
-                        ))
+                        remaining, on_air_seconds=remaining)
             return
 
     log.info("Startup: no missed slots — resuming normal schedule.")
